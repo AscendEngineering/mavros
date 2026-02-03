@@ -406,6 +406,7 @@ public:
 
   Parameter param;
   std::atomic<size_t> retries_remaining;
+  std::atomic<bool> completed{false};
   std::promise<Result> promise;
 };
 
@@ -579,7 +580,10 @@ private:
         // check that ack required
         auto set_it = set_parameters.find(p.param_id);
         if (set_it != set_parameters.end()) {
-          set_it->second->promise.set_value({true, p});
+          // Guard against double-set if timeout already fired
+          if (!set_it->second->completed.exchange(true)) {
+            set_it->second->promise.set_value({true, p});
+          }
         }
 
         RCLCPP_WARN_STREAM_EXPRESSION(
@@ -842,7 +846,10 @@ private:
         RCLCPP_ERROR(
           lg, "PR: Param set for %s timed out.",
           it->second->param.param_id.c_str());
-        it->second->promise.set_value({false, it->second->param});
+        // Guard against double-set if param value arrives late
+        if (!it->second->completed.exchange(true)) {
+          it->second->promise.set_value({false, it->second->param});
+        }
       }
 
     } else {
