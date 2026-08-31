@@ -422,7 +422,7 @@ public:
   : Plugin(uas_, "param", rclcpp::NodeOptions().start_parameter_services(
         false).start_parameter_event_publisher(false)),
     BOOTUP_TIME(10s),
-    LIST_TIMEOUT(30s),
+    LIST_TIMEOUT(120s),
     PARAM_TIMEOUT(1s),
     RETRIES_COUNT(3),
     param_count(-1),
@@ -667,7 +667,7 @@ private:
         go_idle();
         list_receiving.notify_all();
 
-      } else if (param_state == PR::RXPARAM_TIMEDOUT) {
+      } else if (param_state == PR::RXPARAM_TIMEDOUT && it_is_first_requested) {
         uint16_t first_miss_idx = parameters_missing_idx.front();
         RCLCPP_DEBUG(lg, "PR: requesting next timed out parameter idx=%u", first_miss_idx);
         param_request_read("", first_miss_idx);
@@ -764,6 +764,7 @@ private:
       // try later
       RCLCPP_DEBUG(get_logger(), "PR: busy, reschedule pull");
       schedule_pull();
+      return;
     }
 
     RCLCPP_DEBUG(get_logger(), "PR: start scheduled pull");
