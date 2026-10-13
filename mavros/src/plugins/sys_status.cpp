@@ -29,6 +29,8 @@
 #include "mavros/qos.hpp"
 #include "mavros/plugin.hpp"
 #include "mavros/plugin_filter.hpp"
+#include "px4_events/decoder.hpp"
+#include "px4_events/discovery.hpp"
 
 #include "mavros_msgs/msg/state.hpp"
 #include "mavros_msgs/msg/sys_status.hpp"
@@ -484,6 +486,9 @@ private:
  *
  * Implements the
  * [MAVLink Heartbeat/Connection Protocol](https://mavlink.io/en/services/heartbeat.html).
+ *
+ * Optional local PX4 EVENT translation is described in
+ * [PX4 event decoding](../../px4_events.md).
  */
 class SystemStatusPlugin : public plugin::Plugin
 {
@@ -494,6 +499,9 @@ public:
     mem_diag("APM Memory"),
     hwst_diag("APM Hardware"),
     sys_diag("System"),
+    event_decoder([this](uint32_t id, const char * reason) {
+        report_event_decoding_error(id, reason);
+      }),
     conn_heartbeat_mav_type(MAV_TYPE::ONBOARD_CONTROLLER),
     version_retries(RETRIES_COUNT),
     disable_diag(false),
@@ -506,6 +514,22 @@ public:
     }
 
     enable_node_watch_parameters();
+
+    rcl_interfaces::msg::ParameterDescriptor event_parameter;
+    event_parameter.read_only = true;
+    event_parameter.description = "PX4 event decoding configuration; changes require restart.";
+    //! PX4 event logging: disabled (default), local, or auto; changes require restart.
+    const auto event_mode = node->declare_parameter<std::string>(
+      "event_decoding_mode", "disabled", event_parameter);
+    //! Firmware-matching local JSON or JSON.xz definitions; valid only in local mode.
+    const auto event_file = node->declare_parameter<std::string>(
+      "event_metadata_file", "", event_parameter);
+    const auto event_error = event_decoder.configure(event_mode, event_file);
+    if (!event_error.empty()) {
+      RCLCPP_ERROR(
+        node->get_logger(), "PX4 event decoding inactive: %s; retaining raw event logging",
+        event_error.c_str());
+    }
 
     //! Connection timeout in seconds before the link is considered lost.
     node_declare_and_watch_parameter(
@@ -643,6 +667,20 @@ public:
       1s, std::bind(&SystemStatusPlugin::autopilot_version_cb, this),
       srv_cg);
 
+    if (event_mode == "auto" && event_error.empty()) {
+      try {
+        event_discovery = px4_events::Discovery::create(node);
+        RCLCPP_INFO(
+          get_logger(), "PX4 event auto mode currently discovers metadata only; "
+          "retrieval is not implemented, retaining raw event logging");
+      } catch (const std::exception & ex) {
+        RCLCPP_ERROR(
+          get_logger(),
+              "PX4 event metadata discovery setup failed: %s; retaining raw event logging",
+          ex.what());
+      }
+    }
+
     // init state topic
     publish_disconnection();
     enable_connection_cb();
@@ -655,6 +693,8 @@ public:
       make_handler(&SystemStatusPlugin::handle_sys_status),
       make_handler(&SystemStatusPlugin::handle_statustext),
       make_handler(&SystemStatusPlugin::handle_event),
+      make_handler(&SystemStatusPlugin::handle_component_metadata),
+      make_handler(&SystemStatusPlugin::handle_component_information),
       make_handler(&SystemStatusPlugin::handle_meminfo),
       make_handler(&SystemStatusPlugin::handle_hwstatus),
       make_handler(&SystemStatusPlugin::handle_autopilot_version),
@@ -684,6 +724,8 @@ private:
   rclcpp::Publisher<mavros_msgs::msg::StatusText>::SharedPtr statustext_pub;
   rclcpp::Subscription<mavros_msgs::msg::StatusText>::SharedPtr statustext_sub;
   rclcpp::Publisher<mavros_msgs::msg::StatusEvent>::SharedPtr statusevent_pub;
+  px4_events::Decoder event_decoder;
+  std::shared_ptr<px4_events::Discovery> event_discovery;
 
   rclcpp::CallbackGroup::SharedPtr srv_cg;
   rclcpp::Service<mavros_msgs::srv::StreamRate>::SharedPtr stream_rate_srv;
@@ -704,6 +746,14 @@ private:
   mutable std::shared_mutex vehicles_mutex;
 
   /* -*- mid-level helpers -*- */
+
+  void report_event_decoding_error(uint32_t id, const char * reason)
+  {
+    RCLCPP_WARN_ONCE(
+      node->get_logger(),
+      "PX4 event decoding failed for ID %u: %s; retaining raw event logging",
+      static_cast<unsigned int>(id), reason);
+  }
 
   // Get vehicle key for the unordered map containing all vehicles
   inline uint16_t get_vehicle_key(uint8_t sysid, uint8_t compid)
@@ -1071,7 +1121,13 @@ private:
     uint8_t severity = eventm.log_levels & 0x0F;
     // take only 24 LSB, see PX4 "constexpr uint32_t ID(const char (&name)[N])" function
     uint32_t px4_id = eventm.id & 0x00FFFFFF;
-    process_event_normal(severity, px4_id, eventm.arguments);
+    const auto decoded = uas->is_px4() ?
+      event_decoder.decode(eventm.id, eventm.log_levels, eventm.arguments) : std::nullopt;
+    if (decoded) {
+      process_statustext_normal(decoded->severity, decoded->text);
+    } else {
+      process_event_normal(severity, px4_id, eventm.arguments);
+    }
 
     auto evt_msg = mavros_msgs::msg::StatusEvent();
     evt_msg.header.stamp = uas->synchronise_stamp(eventm.event_time_boot_ms);
@@ -1081,6 +1137,32 @@ private:
     evt_msg.sequence = eventm.sequence;
 
     statusevent_pub->publish(evt_msg);
+  }
+
+  void handle_component_metadata(
+    const mavlink::mavlink_message_t * msg,
+    mavlink::common::msg::COMPONENT_METADATA & metadata,
+    plugin::filter::ComponentAndOk filter [[maybe_unused]])
+  {
+    if (event_discovery && uas->is_px4() && uas->is_connected()) {
+      event_discovery->advertisement(
+        msg->sysid, msg->compid, std::string_view(metadata.uri.data(), metadata.uri.size()),
+        metadata.file_crc);
+    }
+  }
+
+  void handle_component_information(
+    const mavlink::mavlink_message_t * msg,
+    mavlink::common::msg::COMPONENT_INFORMATION & metadata,
+    plugin::filter::ComponentAndOk filter [[maybe_unused]])
+  {
+    if (event_discovery && uas->is_px4() && uas->is_connected()) {
+      event_discovery->advertisement(
+        msg->sysid, msg->compid,
+        std::string_view(metadata.general_metadata_uri.data(),
+            metadata.general_metadata_uri.size()),
+        metadata.general_metadata_file_crc);
+    }
   }
 
   void handle_meminfo(
@@ -1388,6 +1470,11 @@ private:
   void connection_cb(bool connected) override
   {
     has_battery_status0 = false;
+
+    if (event_discovery) {
+      event_discovery->connection(
+        connected && uas->is_px4(), uas->get_tgt_system(), uas->get_tgt_component());
+    }
 
     // if connection changes, start delayed version request
     version_retries = RETRIES_COUNT;

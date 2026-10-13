@@ -1,0 +1,302 @@
+//
+// mavros
+// Copyright 2021 Vladimir Ermakov, All rights reserved.
+//
+// This file is part of the mavros package and subject to the license terms
+// in the top-level LICENSE file of the mavros repository.
+// https://github.com/mavlink/mavros/tree/master/LICENSE.md
+//
+
+#include <gtest/gtest.h>
+
+#include <lzma.h>
+
+#include <array>
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
+
+#include <libevents/parse/nlohmann/json.hpp>
+
+#include "../src/plugins/px4_events/decoder.cpp"  // NOLINT(build/include)
+#include "px4_events_test_helpers.hpp"
+
+namespace mavros
+{
+namespace px4_events
+{
+
+// Like the plugin tests, include the implementation to exercise private state
+// without adding a runtime fault-injection API.
+class DecoderTestPeer
+{
+public:
+  static void throw_on_formatting(Decoder & decoder)
+  {
+    decoder.impl_->config.formatters.escape = [](const std::string &) -> std::string {
+        throw std::runtime_error("injected formatting failure");
+      };
+  }
+};
+
+namespace
+{
+std::string metadata()
+{
+  std::ifstream file(TEST_EVENT_METADATA);
+  return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+std::string compress(const std::string & input)
+{
+  std::string output(lzma_stream_buffer_bound(input.size()), '\0');
+  size_t pos = 0;
+  const auto result = lzma_easy_buffer_encode(
+    1, LZMA_CHECK_CRC64, nullptr, reinterpret_cast<const uint8_t *>(input.data()), input.size(),
+    reinterpret_cast<uint8_t *>(output.data()), &pos, output.size());
+  if (result != LZMA_OK) {
+    throw std::runtime_error("cannot compress test metadata");
+  }
+  output.resize(pos);
+  return output;
+}
+
+class Px4EventsTest : public ::testing::Test
+{
+protected:
+  Decoder decoder;
+  std::array<uint8_t, 40> arguments{};
+
+  void SetUp() override
+  {
+    ASSERT_TRUE(decoder.configure("local", TEST_EVENT_METADATA).empty());
+  }
+
+  template<typename T>
+  void argument(size_t offset, T value)
+  {
+    // The fixture encodes the MAVLink little-endian payload explicitly.
+    std::array<uint8_t, sizeof(T)> bytes;
+    std::memcpy(bytes.data(), &value, sizeof(T));
+    const uint16_t endian = 1;
+    if (*reinterpret_cast<const uint8_t *>(&endian) != 1) {
+      std::reverse(bytes.begin(), bytes.end());
+    }
+    std::copy(bytes.begin(), bytes.end(), arguments.begin() + offset);
+  }
+};
+
+TEST_F(Px4EventsTest, full_ids_distinguish_namespaces)
+{
+  auto common = decoder.decode(1, 6, arguments);
+  auto px4 = decoder.decode(0x01000001, 6, arguments);
+  ASSERT_TRUE(common);
+  ASSERT_TRUE(px4);
+  EXPECT_EQ(common->text, "Common namespace");
+  EXPECT_EQ(px4->text, "Count 0; height 0.00 m");
+  EXPECT_FALSE(decoder.decode(0x02000001, 6, arguments));
+  EXPECT_FALSE(decoder.decode(0x010000ff, 6, arguments));
+}
+
+TEST_F(Px4EventsTest, numeric_arguments_use_libevents_formatting)
+{
+  argument<int16_t>(0, -12);
+  argument<float>(2, 3.5f);
+  const auto result = decoder.decode(0x01000001, 3, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Count -12; height 3.50 m");
+  EXPECT_EQ(result->severity, 3);
+}
+
+TEST_F(Px4EventsTest, enums_bitfields_and_unknown_values_retain_information)
+{
+  arguments[0] = 1;
+  arguments[1] = 3;
+  auto result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode Ready; flags GPS|IMU");
+  arguments[0] = 9;
+  arguments[1] = 5;
+  result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode (unknown: 9); flags GPS|(unknown: 5)");
+  arguments[1] = 0;
+  result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode (unknown: 9); flags 0");
+}
+
+TEST_F(Px4EventsTest, disabled_external_severity_is_debug_with_named_protocol_arguments)
+{
+  arguments[0] = 1;
+  argument<uint32_t>(1, 256);
+  const auto result = decoder.decode(0x01000003, 0x38, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->severity, 7);
+  EXPECT_EQ(result->text, "protocol_summary [version=1, checks=256]");
+}
+
+TEST_F(Px4EventsTest, developer_profile_plain_text_and_unprinted_arguments)
+{
+  arguments[0] = 4;
+  arguments[1] = 9;
+  const auto result = decoder.decode(0x01000004, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Developer 4 TEST_PARAM Guide [hidden=9]");
+}
+
+TEST_F(Px4EventsTest, escaped_placeholders_do_not_hide_argument_values)
+{
+  arguments[0] = 4;
+  argument<int8_t>(1, -2);
+  const auto result = decoder.decode(0x01000005, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Literal {1}; value -2 [first=4]");
+}
+
+TEST_F(Px4EventsTest, wide_named_arguments_are_not_narrowed)
+{
+  argument<int64_t>(0, -1234567890123);
+  argument<uint64_t>(8, 18446744073709551615ULL);
+  const auto result = decoder.decode(0x01000006, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Summary [signed=-1234567890123, unsigned=18446744073709551615]");
+}
+
+TEST_F(Px4EventsTest, severity_mapping_and_short_single_line_output)
+{
+  for (uint8_t severity = 0; severity < 8; ++severity) {
+    const auto result = decoder.decode(0x01000007, 0x70 | severity, arguments);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->severity, severity);
+    EXPECT_EQ(result->text, "Warning next line");
+  }
+  EXPECT_FALSE(decoder.decode(0x01000007, 9, arguments));
+}
+
+TEST_F(Px4EventsTest, disabled_and_invalid_configuration_leave_decoder_inactive)
+{
+  EXPECT_TRUE(decoder.configure("disabled", "").empty());
+  EXPECT_FALSE(decoder.decode(1, 6, arguments));
+  for (const auto & mode : {"disabled", "auto", "typo"}) {
+    EXPECT_FALSE(decoder.configure(mode, "/file/that/does/not/exist").empty());
+    EXPECT_FALSE(decoder.decode(1, 6, arguments));
+  }
+  EXPECT_TRUE(decoder.configure("auto", "").empty());
+  EXPECT_FALSE(decoder.decode(1, 6, arguments));
+  EXPECT_FALSE(decoder.configure("local", "").empty());
+  EXPECT_FALSE(decoder.configure("local", "/file/that/does/not/exist").empty());
+}
+
+TEST_F(Px4EventsTest, ordinary_results_do_not_report_decoding_exceptions)
+{
+  int reports = 0;
+  Decoder reporting_decoder([&reports](uint32_t, const char *) {++reports;});
+  EXPECT_FALSE(reporting_decoder.decode(1, 6, arguments));
+  ASSERT_TRUE(reporting_decoder.configure("local", TEST_EVENT_METADATA).empty());
+  EXPECT_TRUE(reporting_decoder.decode(1, 6, arguments));
+  EXPECT_FALSE(reporting_decoder.decode(0x02000001, 6, arguments));
+  EXPECT_FALSE(reporting_decoder.decode(1, 9, arguments));
+  EXPECT_TRUE(reporting_decoder.configure("disabled", "").empty());
+  EXPECT_FALSE(reporting_decoder.decode(1, 6, arguments));
+  EXPECT_EQ(reports, 0);
+}
+
+TEST_F(Px4EventsTest, decoding_exception_reports_details_and_preserves_fallback)
+{
+  int reports = 0;
+  uint32_t reported_id = 0;
+  std::string reported_reason;
+  bool diagnostic_throws = false;
+  Decoder reporting_decoder(
+    [&](uint32_t id, const char * reason) {
+      ++reports;
+      reported_id = id;
+      reported_reason = reason;
+      if (diagnostic_throws) {
+        throw std::runtime_error("injected diagnostic failure");
+      }
+    });
+  ASSERT_TRUE(reporting_decoder.configure("local", TEST_EVENT_METADATA).empty());
+  DecoderTestPeer::throw_on_formatting(reporting_decoder);
+
+  EXPECT_FALSE(reporting_decoder.decode(0x01000007, 4, arguments));
+  EXPECT_EQ(reports, 1);
+  EXPECT_EQ(reported_id, 0x01000007u);
+  EXPECT_EQ(reported_reason, "injected formatting failure");
+
+  // Even an exception from diagnostics must still produce raw fallback.
+  diagnostic_throws = true;
+  EXPECT_FALSE(reporting_decoder.decode(0x01000007, 4, arguments));
+  EXPECT_EQ(reports, 2);
+}
+
+TEST_F(Px4EventsTest, json_and_xz_load_identically_and_corrupt_xz_is_rejected)
+{
+  TemporaryMetadata xz(compress(metadata()), ".json.xz");
+  ASSERT_TRUE(decoder.configure("local", xz.path).empty());
+  const auto result = decoder.decode(1, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Common namespace");
+  TemporaryMetadata corrupt("not an XZ file", ".json.xz");
+  EXPECT_FALSE(decoder.configure("local", corrupt.path).empty());
+  EXPECT_FALSE(decoder.decode(1, 6, arguments));
+  auto truncated = compress(metadata());
+  truncated.resize(truncated.size() - 8);
+  TemporaryMetadata partial(truncated, ".json.xz");
+  EXPECT_FALSE(decoder.configure("local", partial.path).empty());
+}
+
+TEST_F(Px4EventsTest, malformed_metadata_cannot_activate_partial_definitions)
+{
+  for (const auto & text : {"not json", "{\"version\":2}", "{\"version\":2,\"components\":{}}"}) {
+    TemporaryMetadata file(text);
+    EXPECT_FALSE(decoder.configure("local", file.path).empty());
+    EXPECT_FALSE(decoder.decode(1, 6, arguments));
+  }
+  auto json = nlohmann::json::parse(metadata());
+  json["version"] = 3;
+  TemporaryMetadata future(json.dump());
+  EXPECT_FALSE(decoder.configure("local", future.path).empty());
+  json["version"] = 2;
+  json["components"]["1"]["event_groups"]["default"]["events"]["1"]["arguments"][0]["type"] =
+    "invalid";
+  TemporaryMetadata invalid(json.dump());
+  EXPECT_FALSE(decoder.configure("local", invalid.path).empty());
+  EXPECT_FALSE(decoder.decode(1, 6, arguments));
+}
+
+TEST_F(Px4EventsTest, oversized_argument_payload_and_duplicate_full_id_are_rejected)
+{
+  auto json = nlohmann::json::parse(metadata());
+  auto & events = json["components"]["1"]["event_groups"]["default"]["events"];
+  events["6"]["arguments"] = nlohmann::json::array();
+  for (int i = 0; i < 6; ++i) {
+    events["6"]["arguments"].push_back({{"name", "wide"}, {"type", "uint64_t"}});
+  }
+  TemporaryMetadata oversized(json.dump());
+  EXPECT_FALSE(decoder.configure("local", oversized.path).empty());
+  json = nlohmann::json::parse(metadata());
+  json["components"]["1"]["event_groups"]["duplicate"]["events"]["7"] =
+  {{"name", "duplicate"}, {"message", "Conflicting definition"}};
+  TemporaryMetadata duplicate(json.dump());
+  EXPECT_FALSE(decoder.configure("local", duplicate.path).empty());
+}
+
+TEST_F(Px4EventsTest, file_and_decompression_limits_are_enforced)
+{
+  const std::string oversized(Decoder::MAX_JSON_BYTES + 1, ' ');
+  TemporaryMetadata json(oversized);
+  EXPECT_FALSE(decoder.configure("local", json.path).empty());
+  TemporaryMetadata xz(compress(oversized), ".json.xz");
+  EXPECT_FALSE(decoder.configure("local", xz.path).empty());
+  TemporaryMetadata large_xz(std::string(Decoder::MAX_COMPRESSED_BYTES + 1, 'x'), ".json.xz");
+  EXPECT_FALSE(decoder.configure("local", large_xz.path).empty());
+}
+
+}  // namespace
+}  // namespace px4_events
+}  // namespace mavros

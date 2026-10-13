@@ -34,6 +34,7 @@
   <build_export_depend>geographiclib</build_export_depend>
   <build_depend>geographiclib-tools</build_depend>
   <build_export_depend>geographiclib-tools</build_export_depend>
+  <depend>liblzma-dev</depend>
   <!-- pymavlink dependency
   <exec_depend>mavlink</exec_depend>
   -->
@@ -44,6 +45,7 @@
   <depend>message_filters</depend>
   <depend>eigen_stl_containers</depend>
   <depend>libmavconn</depend>
+  <depend>libevents_vendor</depend>
   <depend>pluginlib</depend>
   <!-- XXX <depend>rosconsole_bridge</depend> -->
   <depend>libconsole-bridge-dev</depend>
