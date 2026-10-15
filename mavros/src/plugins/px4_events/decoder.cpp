@@ -56,22 +56,8 @@ std::string read_metadata(const std::string & path)
   if (size > limit) {
     throw std::runtime_error("metadata file exceeds size limit");
   }
-  if (!compressed) {
-    return std::string(reinterpret_cast<const char *>(input.data()), size);
-  }
-
-  std::string output(Decoder::MAX_JSON_BYTES + 1, '\0');
-  uint64_t memory_limit = Decoder::MAX_XZ_MEMORY;
-  size_t input_pos = 0;
-  size_t output_pos = 0;
-  const auto result = lzma_stream_buffer_decode(
-    &memory_limit, 0, nullptr, input.data(), &input_pos, size,
-    reinterpret_cast<uint8_t *>(output.data()), &output_pos, output.size());
-  if (result != LZMA_OK || input_pos != size || output_pos > Decoder::MAX_JSON_BYTES) {
-    throw std::runtime_error("invalid XZ metadata or decompression resource limit exceeded");
-  }
-  output.resize(output_pos);
-  return output;
+  return Decoder::unpack_metadata(
+    std::string_view(reinterpret_cast<const char *>(input.data()), size), compressed);
 }
 
 uint32_t metadata_id(const std::string & text, uint32_t maximum)
@@ -205,6 +191,45 @@ Decoder::Decoder(ErrorCallback report_error)
 {}
 Decoder::~Decoder() = default;
 
+std::string Decoder::unpack_metadata(std::string_view bytes, bool compressed)
+{
+  if (bytes.size() > (compressed ? MAX_COMPRESSED_BYTES : MAX_JSON_BYTES)) {
+    throw std::runtime_error("metadata file exceeds size limit");
+  }
+  if (!compressed) {
+    return std::string(bytes);
+  }
+  std::string output(MAX_JSON_BYTES + 1, '\0');
+  uint64_t memory_limit = MAX_XZ_MEMORY;
+  size_t input_pos = 0;
+  size_t output_pos = 0;
+  const auto result = lzma_stream_buffer_decode(
+    &memory_limit, 0, nullptr, reinterpret_cast<const uint8_t *>(bytes.data()),
+    &input_pos, bytes.size(), reinterpret_cast<uint8_t *>(output.data()),
+    &output_pos, output.size());
+  if (result != LZMA_OK || input_pos != bytes.size() || output_pos > MAX_JSON_BYTES) {
+    throw std::runtime_error("invalid XZ metadata or decompression resource limit exceeded");
+  }
+  output.resize(output_pos);
+  return output;
+}
+
+std::string Decoder::load_json(const std::string & json)
+{
+  impl_.reset();
+  try {
+    if (json.size() > MAX_JSON_BYTES) {
+      throw std::runtime_error("metadata exceeds JSON size limit");
+    }
+    impl_ = std::make_unique<Impl>(json);
+  } catch (const std::exception & ex) {
+    return ex.what();
+  } catch (...) {
+    return "unknown event metadata loading exception";
+  }
+  return {};
+}
+
 void Decoder::report_failure(uint32_t full_id, const char * reason) const noexcept
 {
   try {
@@ -232,7 +257,7 @@ std::string Decoder::configure(const std::string & mode, const std::string & pat
     return "local mode requires event_metadata_file";
   }
   try {
-    impl_ = std::make_unique<Impl>(read_metadata(path));
+    return load_json(read_metadata(path));
   } catch (const std::exception & ex) {
     return ex.what();
   }

@@ -14,6 +14,7 @@
 #include "discovery.hpp"
 
 #include <exception>
+#include <string>
 
 #include "mavconn/mavlink_dialect.hpp"
 
@@ -205,13 +206,15 @@ void Discovery::result_locked(const Request & request, uint8_t result, Clock::ti
     } else {
       fail_locked("legacy metadata request rejected");
     }
-  } else if (result != static_cast<uint8_t>(Result::ACCEPTED) &&
-    result != static_cast<uint8_t>(Result::TEMPORARILY_REJECTED))
-  {
-    fail_locked("metadata request failed");
   } else {
-    // An ACK does not contain the URI. Wait for the advertisement or next retry.
-    service_deadline_ = now + SERVICE_TIMEOUT;
+    if (result != static_cast<uint8_t>(Result::ACCEPTED) &&
+      result != static_cast<uint8_t>(Result::TEMPORARILY_REJECTED))
+    {
+      fail_locked("metadata request failed");
+    } else {
+      // An ACK does not contain the URI. Wait for the advertisement or next retry.
+      service_deadline_ = now + SERVICE_TIMEOUT;
+    }
   }
 }
 

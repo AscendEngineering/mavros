@@ -89,6 +89,22 @@ protected:
   }
 };
 
+TEST_F(Px4EventsTest, in_memory_load_reuses_limits_and_failure_clears_definitions)
+{
+  const auto json = metadata();
+  EXPECT_EQ(Decoder::unpack_metadata(json, false), json);
+  EXPECT_EQ(Decoder::unpack_metadata(compress(json), true), json);
+  EXPECT_THROW(Decoder::unpack_metadata("invalid XZ", true), std::runtime_error);
+  EXPECT_THROW(Decoder::unpack_metadata(
+      std::string(Decoder::MAX_COMPRESSED_BYTES + 1, 'x'), true), std::runtime_error);
+  EXPECT_THROW(Decoder::unpack_metadata(
+      std::string(Decoder::MAX_JSON_BYTES + 1, 'x'), false), std::runtime_error);
+  ASSERT_TRUE(decoder.load_json(json).empty());
+  EXPECT_TRUE(decoder.decode(1, 6, arguments));
+  EXPECT_FALSE(decoder.load_json("invalid JSON").empty());
+  EXPECT_FALSE(decoder.decode(1, 6, arguments));
+}
+
 TEST_F(Px4EventsTest, full_ids_distinguish_namespaces)
 {
   auto common = decoder.decode(1, 6, arguments);

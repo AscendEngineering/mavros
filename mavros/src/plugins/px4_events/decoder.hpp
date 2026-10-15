@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace mavros
 {
@@ -38,6 +39,10 @@ public:
 
   // Called at startup. An error leaves decoding inactive; disabled mode does no I/O.
   std::string configure(const std::string & mode, const std::string & path);
+  // Shared bounded JSON/XZ loading for local files and downloaded metadata.
+  static std::string unpack_metadata(std::string_view bytes, bool compressed);
+  // A failed load leaves decoding inactive; no partially parsed definitions are exposed.
+  std::string load_json(const std::string & json);
 
   std::optional<DecodedEvent> decode(
     uint32_t full_id, uint8_t log_levels, const std::array<uint8_t, 40> & arguments) const;

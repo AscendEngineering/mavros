@@ -209,6 +209,7 @@ target_link_libraries(mavros_plugins PUBLIC
   tf2_ros::tf2_ros
 )
 target_sources(mavros_plugins PRIVATE
+  src/plugins/px4_events/acquisition.cpp
   src/plugins/px4_events/decoder.cpp
   src/plugins/px4_events/discovery.cpp
   src/plugins/px4_events/metadata.cpp)
@@ -284,6 +285,12 @@ if(BUILD_TESTING)
   ament_add_gtest(libmavros-frame-conversions-test test/test_frame_conversions.cpp)
   target_link_libraries(libmavros-frame-conversions-test mavros)
 
+  ament_add_gtest(mavros-ftp-busy-test test/test_ftp_busy.cpp)
+  target_link_libraries(mavros-ftp-busy-test
+    mavros
+    ${std_srvs_TARGETS}
+  )
+
   ament_add_gtest(mavros-px4-events-test test/test_px4_events.cpp)
   target_link_libraries(mavros-px4-events-test libevents_vendor::parser LibLZMA::LibLZMA)
   target_compile_definitions(mavros-px4-events-test PRIVATE
@@ -297,6 +304,13 @@ if(BUILD_TESTING)
     test/test_px4_event_discovery.cpp
     src/plugins/px4_events/discovery.cpp src/plugins/px4_events/metadata.cpp)
   target_link_libraries(mavros-px4-event-discovery-test mavros libevents_vendor::parser)
+
+  ament_add_gtest(mavros-px4-event-acquisition-test
+    test/test_px4_event_acquisition.cpp
+    src/plugins/px4_events/acquisition.cpp
+    src/plugins/px4_events/metadata.cpp src/plugins/px4_events/decoder.cpp)
+  target_link_libraries(mavros-px4-event-acquisition-test
+    mavros libevents_vendor::parser LibLZMA::LibLZMA)
 
   ament_add_gtest(mavros-status-event-test
     test/test_status_event.cpp src/plugins/px4_events/decoder.cpp

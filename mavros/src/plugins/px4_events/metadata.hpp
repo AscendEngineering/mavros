@@ -30,7 +30,10 @@ struct MetadataFile
   uint32_t crc;
 };
 
-/** Accept PX4's mftp://path and hostless mftp:///path forms; throw on invalid input. */
+/**
+ * Accept PX4's mftp://path and hostless mftp:///path forms.
+ * Throw on invalid input.
+ */
 MetadataFile metadata_file(const std::string & uri, uint32_t crc);
 
 /** Read the single EVENTS entry from general JSON; throw if unusable or ambiguous. */
