@@ -4,16 +4,19 @@
 #include "decoder.hpp"
 
 #include <libevents/parse/parser.h>
-#include <lzma.h>
 
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include <libevents/parse/nlohmann/json.hpp>
+
+#include "xz_metadata.hpp"
 
 namespace mavros
 {
@@ -115,6 +118,59 @@ std::string with_unprinted_arguments(EventDefinition definition, const Config & 
   }
   return definition.message;
 }
+
+std::optional<std::string> compact_bitfield(
+  const events::parser::EventArgumentDefinition & argument, uint64_t raw_value)
+{
+  const auto & enumeration = *argument.enum_def;
+  const int bits = events::parser::baseTypeSize(argument.type) * 8;
+  if (bits <= 0 || bits > 64) {
+    throw std::runtime_error("unsupported bitfield argument width");
+  }
+  const uint64_t mask = ~uint64_t{0} >> (64 - bits);
+  const uint64_t value = raw_value & mask;
+  if (value == 0) {
+    return "0";
+  }
+  // PX4 health checks use an all-bits mask for broadly applicable failures.
+  // Other bitfields must retain their individual flag meanings.
+  if (enumeration.event_namespace == "px4" &&
+    enumeration.name == "navigation_mode_group_t" && argument.name == "modes" && value == mask)
+  {
+    return "all";
+  }
+
+  uint64_t known = 0;
+  for (const auto & entry : enumeration.entries) {
+    const uint64_t bit = entry.first;
+    if (bit != 0 && (bit & (bit - 1)) == 0) {
+      known |= bit;
+    }
+  }
+  const uint64_t unknown = value & ~known;
+  if (unknown == 0) {
+    return std::nullopt;
+  }
+
+  std::ostringstream text;
+  bool had_entry = false;
+  for (int i = 0; i < bits; ++i) {
+    const uint64_t bit = uint64_t{1} << i;
+    const auto entry = enumeration.entries.find(bit);
+    if ((value & bit) != 0 && entry != enumeration.entries.end()) {
+      if (had_entry) {
+        text << enumeration.entry_separator;
+      }
+      text << entry->second.description;
+      had_entry = true;
+    }
+  }
+  if (had_entry) {
+    text << enumeration.entry_separator;
+  }
+  text << "unknown_bits=0x" << std::hex << std::setfill('0') << std::setw(bits / 4) << unknown;
+  return text.str();
+}
 }  // namespace
 
 struct Decoder::Impl
@@ -199,19 +255,7 @@ std::string Decoder::unpack_metadata(std::string_view bytes, bool compressed)
   if (!compressed) {
     return std::string(bytes);
   }
-  std::string output(MAX_JSON_BYTES + 1, '\0');
-  uint64_t memory_limit = MAX_XZ_MEMORY;
-  size_t input_pos = 0;
-  size_t output_pos = 0;
-  const auto result = lzma_stream_buffer_decode(
-    &memory_limit, 0, nullptr, reinterpret_cast<const uint8_t *>(bytes.data()),
-    &input_pos, bytes.size(), reinterpret_cast<uint8_t *>(output.data()),
-    &output_pos, output.size());
-  if (result != LZMA_OK || input_pos != bytes.size() || output_pos > MAX_JSON_BYTES) {
-    throw std::runtime_error("invalid XZ metadata or decompression resource limit exceeded");
-  }
-  output.resize(output_pos);
-  return output;
+  return unpack_xz_metadata(bytes, MAX_JSON_BYTES);
 }
 
 std::string Decoder::load_json(const std::string & json)
@@ -282,21 +326,27 @@ std::optional<DecodedEvent> Decoder::decode(
     std::copy(arguments.begin(), arguments.end(), event.arguments);
     const ParsedEvent parsed(event, impl_->config, found->second);
     std::optional<EventDefinition> definition;
-    std::vector<EnumDefinition> zero_bitfields;
+    std::vector<EnumDefinition> formatted_bitfields;
     for (int i = 0; i < parsed.numArguments(); ++i) {
       const auto & argument = parsed.argument(static_cast<size_t>(i));
-      if (argument.isEnum() && argument.enum_def->is_bitfield && parsed.argumentValueInt(i) == 0) {
-        // libevents renders an empty bitfield as an empty string. Supply a
-        // temporary zero enum entry so the absence of flags remains explicit.
+      if (argument.isEnum() && argument.enum_def->is_bitfield) {
+        const uint64_t value = parsed.argumentValueInt(i);
+        const auto formatted = compact_bitfield(argument, value);
+        if (!formatted) {
+          continue;
+        }
+        // Override this value for one render; leave shared definitions and
+        // argument bytes untouched. Reserve once to keep enum pointers stable.
         if (!definition) {
           definition = found->second;
-          zero_bitfields.reserve(found->second.arguments.size());
+          formatted_bitfields.reserve(found->second.arguments.size());
         }
-        zero_bitfields.push_back(*argument.enum_def);
-        auto & zero = zero_bitfields.back();
-        zero.is_bitfield = false;
-        zero.entries[0].description = "0";
-        definition->arguments[static_cast<size_t>(i)].enum_def = &zero;
+        formatted_bitfields.push_back(*argument.enum_def);
+        auto & override_enum = formatted_bitfields.back();
+        override_enum.is_bitfield = false;
+        override_enum.entries.clear();
+        override_enum.entries[value].description = *formatted;
+        definition->arguments[static_cast<size_t>(i)].enum_def = &override_enum;
       }
     }
     const auto text = single_line(

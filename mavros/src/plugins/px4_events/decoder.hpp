@@ -30,7 +30,6 @@ class Decoder
 public:
   static constexpr size_t MAX_COMPRESSED_BYTES = 1024 * 1024;
   static constexpr size_t MAX_JSON_BYTES = 8 * 1024 * 1024;
-  static constexpr uint64_t MAX_XZ_MEMORY = 64 * 1024 * 1024;
 
   using ErrorCallback = std::function<void (uint32_t, const char *)>;
 

@@ -16,6 +16,9 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -31,6 +34,7 @@
 #include "mavros/plugin_filter.hpp"
 #include "px4_events/decoder.hpp"
 #include "px4_events/discovery.hpp"
+#include "px4_events/acquisition.hpp"
 
 #include "mavros_msgs/msg/state.hpp"
 #include "mavros_msgs/msg/sys_status.hpp"
@@ -487,7 +491,7 @@ private:
  * Implements the
  * [MAVLink Heartbeat/Connection Protocol](https://mavlink.io/en/services/heartbeat.html).
  *
- * Optional local PX4 EVENT translation is described in
+ * Optional PX4 EVENT translation is described in
  * [PX4 event decoding](../../px4_events.md).
  */
 class SystemStatusPlugin : public plugin::Plugin
@@ -499,9 +503,10 @@ public:
     mem_diag("APM Memory"),
     hwst_diag("APM Hardware"),
     sys_diag("System"),
-    event_decoder([this](uint32_t id, const char * reason) {
-        report_event_decoding_error(id, reason);
-      }),
+    event_decoder(std::make_shared<px4_events::Decoder>(
+        [logger = get_logger()](uint32_t id, const char * reason) {
+          report_event_decoding_error(logger, id, reason);
+        })),
     conn_heartbeat_mav_type(MAV_TYPE::ONBOARD_CONTROLLER),
     version_retries(RETRIES_COUNT),
     disable_diag(false),
@@ -524,7 +529,15 @@ public:
     //! Firmware-matching local JSON or JSON.xz definitions; valid only in local mode.
     const auto event_file = node->declare_parameter<std::string>(
       "event_metadata_file", "", event_parameter);
-    const auto event_error = event_decoder.configure(event_mode, event_file);
+    //! Automatic metadata download delay from FCU connection, in seconds.
+    event_download_delay = node->declare_parameter<double>(
+      "event_metadata_download_delay", 20.0, event_parameter);
+    auto event_error = event_decoder->configure(event_mode, event_file);
+    if (event_error.empty() && event_mode == "auto" &&
+      (!std::isfinite(event_download_delay) || event_download_delay < 0))
+    {
+      event_error = "event_metadata_download_delay must be finite and nonnegative";
+    }
     if (!event_error.empty()) {
       RCLCPP_ERROR(
         node->get_logger(), "PX4 event decoding inactive: %s; retaining raw event logging",
@@ -669,15 +682,20 @@ public:
 
     if (event_mode == "auto" && event_error.empty()) {
       try {
-        event_discovery = px4_events::Discovery::create(node);
-        RCLCPP_INFO(
-          get_logger(), "PX4 event auto mode currently discovers metadata only; "
-          "retrieval is not implemented, retaining raw event logging");
+        auto discovery = px4_events::Discovery::create(node);
+        auto acquisition = px4_events::Acquisition::create(node,
+            [logger = get_logger()](uint32_t id, const char * reason) {
+              report_event_decoding_error(logger, id, reason);
+          });
+        event_discovery = std::move(discovery);
+        event_acquisition = std::move(acquisition);
       } catch (const std::exception & ex) {
         RCLCPP_ERROR(
           get_logger(),
-              "PX4 event metadata discovery setup failed: %s; retaining raw event logging",
+              "PX4 event metadata setup failed: %s; retaining raw event logging",
           ex.what());
+      } catch (...) {
+        RCLCPP_ERROR(get_logger(), "PX4 event metadata setup failed; retaining raw event logging");
       }
     }
 
@@ -724,8 +742,20 @@ private:
   rclcpp::Publisher<mavros_msgs::msg::StatusText>::SharedPtr statustext_pub;
   rclcpp::Subscription<mavros_msgs::msg::StatusText>::SharedPtr statustext_sub;
   rclcpp::Publisher<mavros_msgs::msg::StatusEvent>::SharedPtr statusevent_pub;
-  px4_events::Decoder event_decoder;
+  friend class SystemStatusEventTestPeer;
+  using EventClock = std::chrono::steady_clock;
+  // Acquisition start/cancel may complete inline and re-enter the result handler.
+  std::recursive_mutex event_mutex;
+  std::shared_ptr<px4_events::Decoder> event_decoder;
   std::shared_ptr<px4_events::Discovery> event_discovery;
+  std::shared_ptr<px4_events::Acquisition> event_acquisition;
+  rclcpp::TimerBase::SharedPtr event_start_timer;
+  double event_download_delay{20.0};
+  EventClock::time_point event_connected_at{};
+  uint64_t event_generation{0};
+  bool event_connected{false};
+  bool event_download_ready{false};
+  bool event_acquisition_started{false};
 
   rclcpp::CallbackGroup::SharedPtr srv_cg;
   rclcpp::Service<mavros_msgs::srv::StreamRate>::SharedPtr stream_rate_srv;
@@ -747,12 +777,127 @@ private:
 
   /* -*- mid-level helpers -*- */
 
-  void report_event_decoding_error(uint32_t id, const char * reason)
+  static void report_event_decoding_error(
+    const rclcpp::Logger & logger, uint32_t id, const char * reason)
   {
     RCLCPP_WARN_ONCE(
-      node->get_logger(),
+      logger,
       "PX4 event decoding failed for ID %u: %s; retaining raw event logging",
       static_cast<unsigned int>(id), reason);
+  }
+
+  void event_acquisition_complete(uint64_t generation, px4_events::Acquisition::Result result)
+  {
+    std::lock_guard<std::recursive_mutex> lock(event_mutex);
+    if (generation != event_generation || !event_connected ||
+      !uas->is_connected() || !uas->is_px4() || !result.decoder)
+    {
+      return;
+    }
+    event_decoder = std::shared_ptr<px4_events::Decoder>(std::move(result.decoder));
+    RCLCPP_INFO(get_logger(), "PX4 event metadata ready; decoded logging enabled");
+  }
+
+  // event_mutex serializes start with disconnect/cancel; no intermediate result queue.
+  void maybe_start_event_acquisition_locked(EventClock::time_point now)
+  {
+    if (!event_connected || event_acquisition_started) {
+      return;
+    }
+    if (!event_download_ready) {
+      if (std::chrono::duration<double>(now - event_connected_at).count() < event_download_delay) {
+        return;
+      }
+      event_download_ready = true;
+      if (event_start_timer) {
+        event_start_timer->cancel();
+      }
+    }
+    const auto metadata = event_discovery->metadata();
+    if (!metadata) {
+      return;  // A later advertisement uses the same start gate.
+    }
+    event_acquisition_started = true;
+    const auto generation = event_generation;
+    const std::weak_ptr<SystemStatusPlugin> weak =
+      std::static_pointer_cast<SystemStatusPlugin>(shared_from_this());
+    if (!event_acquisition->start(*metadata,
+      [weak, generation](px4_events::Acquisition::Result result) {
+        if (const auto self = weak.lock()) {
+          self->event_acquisition_complete(generation, std::move(result));
+        }
+        }))
+    {
+      RCLCPP_WARN(get_logger(),
+            "PX4 event metadata acquisition already active; retaining raw logging");
+    }
+  }
+
+  void event_download_delay_cb(uint64_t generation, EventClock::time_point now)
+  {
+    std::lock_guard<std::recursive_mutex> lock(event_mutex);
+    if (generation != event_generation) {
+      return;
+    }
+    try {
+      maybe_start_event_acquisition_locked(now);
+    } catch (const std::exception & ex) {
+      event_acquisition_started = true;
+      if (event_start_timer) {
+        event_start_timer->cancel();
+      }
+      event_acquisition->cancel();
+      RCLCPP_ERROR(get_logger(), "PX4 event metadata start failed: %s; retaining raw logging",
+            ex.what());
+    } catch (...) {
+      event_acquisition_started = true;
+      if (event_start_timer) {
+        event_start_timer->cancel();
+      }
+      event_acquisition->cancel();
+      RCLCPP_ERROR(get_logger(), "PX4 event metadata start failed; retaining raw logging");
+    }
+  }
+
+  void event_connection_cb(bool connected)
+  {
+    if (!event_discovery) {
+      return;  // Disabled/local/invalid configuration has no automatic resources.
+    }
+    std::lock_guard<std::recursive_mutex> lock(event_mutex);
+    ++event_generation;  // Invalidate results before cancellation can deliver a callback.
+    event_connected = connected && uas->is_px4();
+    event_acquisition_started = false;
+    event_download_ready = false;
+    event_connected_at = EventClock::now();
+    event_decoder.reset();
+    try {
+      if (event_start_timer) {
+        event_start_timer->cancel();
+      }
+      event_acquisition->cancel();
+      event_discovery->connection(
+        event_connected, uas->get_tgt_system(), uas->get_tgt_component());
+      if (!event_connected) {
+        return;
+      }
+      const auto generation = event_generation;
+      const std::weak_ptr<SystemStatusPlugin> weak =
+        std::static_pointer_cast<SystemStatusPlugin>(shared_from_this());
+      event_start_timer = node->create_wall_timer(250ms, [weak, generation]() {
+            if (const auto self = weak.lock()) {
+              self->event_download_delay_cb(generation, EventClock::now());
+            }
+        });
+      event_download_delay_cb(generation, EventClock::now());
+    } catch (const std::exception & ex) {
+      event_acquisition_started = true;
+      RCLCPP_ERROR(get_logger(), "PX4 event metadata timer setup failed: %s; retaining raw logging",
+        ex.what());
+    } catch (...) {
+      event_acquisition_started = true;
+      RCLCPP_ERROR(get_logger(), "PX4 event metadata timer setup failed; retaining raw logging");
+    }
   }
 
   // Get vehicle key for the unordered map containing all vehicles
@@ -1121,8 +1266,13 @@ private:
     uint8_t severity = eventm.log_levels & 0x0F;
     // take only 24 LSB, see PX4 "constexpr uint32_t ID(const char (&name)[N])" function
     uint32_t px4_id = eventm.id & 0x00FFFFFF;
-    const auto decoded = uas->is_px4() ?
-      event_decoder.decode(eventm.id, eventm.log_levels, eventm.arguments) : std::nullopt;
+    std::shared_ptr<px4_events::Decoder> decoder;
+    {
+      std::lock_guard<std::recursive_mutex> lock(event_mutex);
+      decoder = event_decoder;
+    }
+    const auto decoded = uas->is_px4() && decoder ?
+      decoder->decode(eventm.id, eventm.log_levels, eventm.arguments) : std::nullopt;
     if (decoded) {
       process_statustext_normal(decoded->severity, decoded->text);
     } else {
@@ -1144,10 +1294,12 @@ private:
     mavlink::common::msg::COMPONENT_METADATA & metadata,
     plugin::filter::ComponentAndOk filter [[maybe_unused]])
   {
-    if (event_discovery && uas->is_px4() && uas->is_connected()) {
+    std::lock_guard<std::recursive_mutex> lock(event_mutex);
+    if (event_discovery && event_connected && uas->is_px4() && uas->is_connected()) {
       event_discovery->advertisement(
         msg->sysid, msg->compid, std::string_view(metadata.uri.data(), metadata.uri.size()),
         metadata.file_crc);
+      event_download_delay_cb(event_generation, EventClock::now());
     }
   }
 
@@ -1156,12 +1308,14 @@ private:
     mavlink::common::msg::COMPONENT_INFORMATION & metadata,
     plugin::filter::ComponentAndOk filter [[maybe_unused]])
   {
-    if (event_discovery && uas->is_px4() && uas->is_connected()) {
+    std::lock_guard<std::recursive_mutex> lock(event_mutex);
+    if (event_discovery && event_connected && uas->is_px4() && uas->is_connected()) {
       event_discovery->advertisement(
         msg->sysid, msg->compid,
         std::string_view(metadata.general_metadata_uri.data(),
             metadata.general_metadata_uri.size()),
         metadata.general_metadata_file_crc);
+      event_download_delay_cb(event_generation, EventClock::now());
     }
   }
 
@@ -1471,10 +1625,7 @@ private:
   {
     has_battery_status0 = false;
 
-    if (event_discovery) {
-      event_discovery->connection(
-        connected && uas->is_px4(), uas->get_tgt_system(), uas->get_tgt_component());
-    }
+    event_connection_cb(connected);
 
     // if connection changes, start delayed version request
     version_retries = RETRIES_COUNT;

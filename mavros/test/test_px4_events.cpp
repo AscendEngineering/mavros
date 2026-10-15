@@ -64,6 +64,27 @@ std::string compress(const std::string & input)
   return output;
 }
 
+nlohmann::json health_metadata()
+{
+  auto json = nlohmann::json::parse(metadata());
+  auto & px4 = json["components"]["1"];
+  px4["enums"]["navigation_mode_group_t"] = {
+    {"type", "uint32_t"}, {"is_bitfield", true},
+    {"entries", {
+        {"4", {{"name", "position"}, {"description", "Position mode"}}},
+        {"8", {{"name", "mission"}, {"description", "Mission mode"}}}
+      }}
+  };
+  px4["event_groups"]["default"]["events"]["8"] = {
+    {"name", "health"}, {"message", "Health check"},
+    {"arguments", {
+        {{"name", "modes"}, {"type", "navigation_mode_group_t"}},
+        {{"name", "flags"}, {"type", "flags_t"}}
+      }}
+  };
+  return json;
+}
+
 class Px4EventsTest : public ::testing::Test
 {
 protected:
@@ -138,11 +159,75 @@ TEST_F(Px4EventsTest, enums_bitfields_and_unknown_values_retain_information)
   arguments[1] = 5;
   result = decoder.decode(0x01000002, 6, arguments);
   ASSERT_TRUE(result);
-  EXPECT_EQ(result->text, "Mode (unknown: 9); flags GPS|(unknown: 5)");
+  EXPECT_EQ(result->text, "Mode (unknown: 9); flags GPS|unknown_bits=0x04");
+  arguments[1] = 0xfd;
+  result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode (unknown: 9); flags GPS|unknown_bits=0xfc");
+  arguments[1] = 0xff;
+  result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode (unknown: 9); flags GPS|IMU|unknown_bits=0xfc");
   arguments[1] = 0;
   result = decoder.decode(0x01000002, 6, arguments);
   ASSERT_TRUE(result);
   EXPECT_EQ(result->text, "Mode (unknown: 9); flags 0");
+}
+
+TEST_F(Px4EventsTest, px4_all_modes_is_compact_and_other_bitfields_keep_details)
+{
+  ASSERT_TRUE(decoder.load_json(health_metadata().dump()).empty());
+  argument<uint32_t>(0, 0xffffffff);
+  arguments[4] = 0xff;
+  auto result = decoder.decode(0x01000008, 4, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Health check [modes=all, flags=GPS|IMU|unknown_bits=0xfc]");
+
+  argument<uint32_t>(0, 12);
+  arguments[4] = 0;
+  result = decoder.decode(0x01000008, 4, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Health check [modes=Position mode|Mission mode, flags=0]");
+
+  argument<uint32_t>(0, 0x1004);
+  result = decoder.decode(0x01000008, 4, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Health check [modes=Position mode|unknown_bits=0x00001000, flags=0]");
+}
+
+TEST_F(Px4EventsTest, all_modes_shorthand_requires_px4_namespace_and_modes_argument)
+{
+  auto json = health_metadata();
+  json["components"]["1"]["namespace"] = "other";
+  ASSERT_TRUE(decoder.load_json(json.dump()).empty());
+  argument<uint32_t>(0, 0xffffffff);
+  auto result = decoder.decode(0x01000008, 4, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text,
+    "Health check [modes=Position mode|Mission mode|unknown_bits=0xfffffff3, flags=0]");
+
+  json = health_metadata();
+  auto & health = json["components"]["1"]["event_groups"]["default"]["events"]["8"];
+  health["arguments"][0]["name"] = "other_flags";
+  ASSERT_TRUE(decoder.load_json(json.dump()).empty());
+  result = decoder.decode(0x01000008, 4, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text,
+    "Health check [other_flags=Position mode|Mission mode|unknown_bits=0xfffffff3, flags=0]");
+}
+
+TEST_F(Px4EventsTest, wide_bitfield_combines_unknown_high_bits_and_preserves_separator)
+{
+  auto json = nlohmann::json::parse(metadata());
+  auto & flags = json["components"]["1"]["enums"]["flags_t"];
+  flags["type"] = "uint64_t";
+  flags["separator"] = ", ";
+  ASSERT_TRUE(decoder.load_json(json.dump()).empty());
+  arguments[0] = 1;
+  argument<uint64_t>(1, (uint64_t{1} << 63) | (uint64_t{1} << 32) | 1);
+  const auto result = decoder.decode(0x01000002, 6, arguments);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->text, "Mode Ready; flags GPS, unknown_bits=0x8000000100000000");
 }
 
 TEST_F(Px4EventsTest, disabled_external_severity_is_debug_with_named_protocol_arguments)

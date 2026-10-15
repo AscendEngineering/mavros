@@ -10,10 +10,17 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdint>
 #include <future>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,6 +32,40 @@
 
 namespace mavros
 {
+namespace std_plugins
+{
+class SystemStatusEventTestPeer
+{
+public:
+  static uint64_t generation(SystemStatusPlugin & plugin)
+  {
+    std::lock_guard<std::recursive_mutex> lock(plugin.event_mutex);
+    return plugin.event_generation;
+  }
+
+  static void elapsed(SystemStatusPlugin & plugin, unsigned seconds)
+  {
+    std::lock_guard<std::recursive_mutex> lock(plugin.event_mutex);
+    // Advance the clock check, never override the configured delay.
+    plugin.event_download_delay_cb(plugin.event_generation,
+      plugin.event_connected_at + std::chrono::seconds(seconds));
+  }
+
+  static std::shared_ptr<px4_events::Decoder> decoder(SystemStatusPlugin & plugin)
+  {
+    std::lock_guard<std::recursive_mutex> lock(plugin.event_mutex);
+    return plugin.event_decoder;
+  }
+
+  static void complete(
+    SystemStatusPlugin & plugin, uint64_t generation,
+    std::unique_ptr<px4_events::Decoder> decoder)
+  {
+    plugin.event_acquisition_complete(generation, {std::move(decoder), {}, false});
+  }
+};
+}  // namespace std_plugins
+
 namespace uas
 {
 namespace
@@ -44,6 +85,7 @@ void capture_log(
   const std::string message(text);
   if (message.find("FCU: ") == 0 || message.find("PX4 event decoding inactive:") == 0 ||
     message.find("PX4 event decoding failed for ID ") == 0 ||
+    message.find("PX4 event acquisition failed:") == 0 ||
     message.find("PX4 event metadata ") == 0)
   {
     std::lock_guard<std::mutex> lock(log_mutex);
@@ -220,6 +262,8 @@ TEST_F(StatusEventTest, disabled_by_default_retains_raw_disabled_severity_behavi
   start("test_event_disabled");
   EXPECT_EQ(plugin->get_node()->get_parameter("event_decoding_mode").as_string(), "disabled");
   EXPECT_TRUE(plugin->get_node()->get_parameter("event_metadata_file").as_string().empty());
+  EXPECT_DOUBLE_EQ(plugin->get_node()->get_parameter("event_metadata_download_delay").as_double(),
+          20.0);
   inject(0x01000003, 8);
   const auto lines = logs();
   ASSERT_EQ(lines.size(), 1u);
@@ -255,10 +299,13 @@ TEST_F(StatusEventTest, decoding_parameters_require_restart)
   const auto node = plugin->get_node();
   EXPECT_TRUE(node->describe_parameter("event_decoding_mode").read_only);
   EXPECT_TRUE(node->describe_parameter("event_metadata_file").read_only);
+  EXPECT_TRUE(node->describe_parameter("event_metadata_download_delay").read_only);
   EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_decoding_mode",
           "disabled")).successful);
   EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_file",
           "/other.json")).successful);
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_download_delay",
+          10.0)).successful);
   inject();
   const auto lines = logs();
   ASSERT_EQ(lines.size(), 1u);
@@ -362,6 +409,285 @@ TEST_F(StatusEventTest, invalid_auto_local_path_does_not_start_discovery)
   EXPECT_EQ(lines[1].second.find("FCU: EVENT 7 with args -42-0-"), 0U);
 }
 
+TEST_F(StatusEventTest, invalid_negative_download_delay_retains_raw_logging_without_discovery)
+{
+  expect_no_metadata_requests("test_event_auto_negative");
+  inject();
+  const auto lines = logs();
+  ASSERT_EQ(lines.size(), 2U);
+  EXPECT_NE(lines[0].second.find("finite and nonnegative"), std::string::npos);
+  EXPECT_EQ(lines[1].second.find("FCU: EVENT 7 with args -42-0-"), 0U);
+}
+
+TEST_F(StatusEventTest, invalid_nonfinite_download_delay_does_not_start_discovery)
+{
+  expect_no_metadata_requests("test_event_auto_infinite");
+  const auto lines = logs();
+  ASSERT_EQ(lines.size(), 1U);
+  EXPECT_NE(lines[0].second.find("finite and nonnegative"), std::string::npos);
+}
+
+TEST_F(StatusEventTest, large_finite_delay_is_accepted_without_duration_overflow)
+{
+  start("test_event_auto_large");
+  uas->update_connection_status(true);
+  std_plugins::SystemStatusEventTestPeer::elapsed(*plugin, 20);
+  EXPECT_TRUE(logs().empty());
+  uas->update_connection_status(false);
+}
+
+TEST_F(StatusEventTest, local_definitions_survive_disconnect)
+{
+  start("test_event_local");
+  const auto decoder = std_plugins::SystemStatusEventTestPeer::decoder(*plugin);
+  uas->update_connection_status(true);
+  uas->update_connection_status(false);
+  EXPECT_EQ(std_plugins::SystemStatusEventTestPeer::decoder(*plugin), decoder);
+  inject();
+  ASSERT_EQ(logs().size(), 1U);
+  EXPECT_EQ(logs()[0].second, "FCU: Warning next line");
+}
+
+class AutoStatusEventTest : public StatusEventTest
+{
+protected:
+  using Peer = std_plugins::SystemStatusEventTestPeer;
+  using Open = mavros_msgs::srv::FileOpen;
+  using Read = mavros_msgs::srv::FileRead;
+  using Close = mavros_msgs::srv::FileClose;
+  rclcpp::Node::SharedPtr server;
+  rclcpp::Service<Open>::SharedPtr open_service;
+  rclcpp::Service<Read>::SharedPtr read_service;
+  rclcpp::Service<Close>::SharedPtr close_service;
+  rclcpp::Service<mavros_msgs::srv::CommandLong>::SharedPtr command_service;
+  rclcpp::executors::SingleThreadedExecutor executor;
+  std::string general;
+  std::string definitions;
+  std::vector<std::string> opens;
+  bool missing_file{false};
+  bool hold_read{false};
+  std::shared_ptr<rmw_request_id_t> held_read;
+
+  void start_auto(const std::string & name = "test_event_auto")
+  {
+    std::ifstream file(TEST_EVENT_METADATA);
+    definitions.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(definitions.empty());
+    general =
+      "{\"version\":1,\"metadataTypes\":[{\"type\":4,\"uri\":\"mftp://events.json\",\"fileCrc\":" +
+      std::to_string(px4_events::metadata_crc32(definitions)) + "}]}";
+    server = std::make_shared<rclcpp::Node>("auto_event_ftp_stub");
+    const auto prefix = "/" + name;
+    open_service = server->create_service<Open>(prefix + "/ftp/open",
+        [this](Open::Request::SharedPtr request, Open::Response::SharedPtr response) {
+          opens.push_back(request->file_path);
+          response->success = !missing_file;
+          response->r_errno = missing_file ? ENOENT : 0;
+          response->size = request->file_path ==
+          "general.json" ? general.size() : definitions.size();
+      });
+    read_service = server->create_service<Read>(prefix + "/ftp/read",
+        [this](std::shared_ptr<rmw_request_id_t> header, Read::Request::SharedPtr request) {
+          if (hold_read) {
+            held_read = header;
+            return;
+          }
+          Read::Response response;
+          response.success = true;
+          const auto & bytes = request->file_path == "general.json" ? general : definitions;
+          const auto chunk = bytes.substr(request->offset, request->size);
+          response.data.assign(chunk.begin(), chunk.end());
+          read_service->send_response(*header, response);
+      });
+    close_service = server->create_service<Close>(
+      prefix + "/ftp/close",
+      [](Close::Request::SharedPtr, Close::Response::SharedPtr response) {
+        response->success = true;
+      });
+    command_service = server->create_service<mavros_msgs::srv::CommandLong>(
+      prefix + "/cmd/command",
+      [](mavros_msgs::srv::CommandLong::Request::SharedPtr,
+      mavros_msgs::srv::CommandLong::Response::SharedPtr response) {
+        response->success = true;
+      });
+    start(name);
+    executor.add_node(plugin->get_node());
+    executor.add_node(server);
+    uas->update_connection_status(true);
+  }
+
+  void advertise(bool legacy = false)
+  {
+    mavlink::mavlink_message_t message;
+    if (legacy) {
+      mavlink::common::msg::COMPONENT_INFORMATION metadata{};
+      mavlink::set_string(metadata.general_metadata_uri, "mftp://general.json");
+      metadata.general_metadata_file_crc = px4_events::metadata_crc32(general);
+      message = convert_message(metadata);
+    } else {
+      mavlink::common::msg::COMPONENT_METADATA metadata{};
+      mavlink::set_string(metadata.uri, "mftp://general.json");
+      metadata.file_crc = px4_events::metadata_crc32(general);
+      message = convert_message(metadata);
+    }
+    message.sysid = 1;
+    message.compid = 1;
+    route(uas, &message, mavconn::Framing::ok);
+  }
+
+  bool spin_until(const std::function<bool ()> & done)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      std::this_thread::sleep_for(1ms);
+    }
+    return done();
+  }
+
+  void TearDown() override
+  {
+    if (plugin) {
+      uas->update_connection_status(false);
+      executor.remove_node(plugin->get_node());
+    }
+    if (server) {
+      executor.remove_node(server);
+    }
+    StatusEventTest::TearDown();
+  }
+};
+
+TEST_F(AutoStatusEventTest, default_delay_gates_ftp_then_activates_and_preserves_raw_topic)
+{
+  start_auto();
+  advertise();
+  Peer::elapsed(*plugin, 19);
+  executor.spin_some();
+  EXPECT_TRUE(opens.empty());
+  inject();
+  EXPECT_EQ(logs().back().second.find("FCU: EVENT 7 with args -42-0-"), 0U);
+  Peer::elapsed(*plugin, 20);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_EQ(opens, (std::vector<std::string>{"general.json", "events.json"}));
+  std::optional<mavros_msgs::msg::StatusEvent> raw;
+  auto subscription = server->create_subscription<mavros_msgs::msg::StatusEvent>(
+    "/test_event_auto/status_event", rclcpp::SensorDataQoS(),
+    [&raw](mavros_msgs::msg::StatusEvent::ConstSharedPtr message) {raw = *message;});
+  ASSERT_TRUE(spin_until([&subscription]() {return subscription->get_publisher_count() > 0;}));
+  inject();
+  ASSERT_TRUE(spin_until([&raw]() {return raw.has_value();}));
+  EXPECT_EQ(raw->px4_id, 7U);
+  EXPECT_EQ(raw->sequence, 123);
+  EXPECT_EQ(raw->severity, 4);
+  EXPECT_EQ(raw->arguments[0], 42);
+  EXPECT_EQ(logs().back().second, "FCU: Warning next line");
+  advertise();
+  Peer::elapsed(*plugin, 40);
+  executor.spin_some();
+  EXPECT_EQ(opens.size(), 2U);
+  const auto snapshot = Peer::decoder(*plugin);
+  uas->update_connection_status(false);
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  EXPECT_TRUE(snapshot->decode(0x01000007, 4, {}));
+  inject();
+  EXPECT_EQ(logs().back().second.find("FCU: EVENT 7 with args -42-0-"), 0U);
+}
+
+TEST_F(AutoStatusEventTest, late_legacy_advertisement_starts_after_elapsed_delay)
+{
+  start_auto();
+  Peer::elapsed(*plugin, 20);
+  executor.spin_some();
+  EXPECT_TRUE(opens.empty());
+  advertise(true);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+}
+
+TEST_F(AutoStatusEventTest, explicitly_configured_zero_delay_starts_on_advertisement)
+{
+  start_auto("test_event_auto_zero");
+  EXPECT_DOUBLE_EQ(plugin->get_node()->get_parameter("event_metadata_download_delay").as_double(),
+          0.0);
+  advertise();
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+}
+
+TEST_F(AutoStatusEventTest, terminal_failure_stays_raw_until_next_connection)
+{
+  start_auto();
+  missing_file = true;
+  advertise();
+  Peer::elapsed(*plugin, 20);
+  ASSERT_TRUE(spin_until([this]() {
+      const auto lines = logs();
+      return std::any_of(lines.begin(), lines.end(), [](const auto & line) {
+               return line.second.find("PX4 event acquisition failed:") == 0;
+      });
+    }));
+  advertise();
+  Peer::elapsed(*plugin, 40);
+  executor.spin_some();
+  EXPECT_EQ(opens.size(), 1U);
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  inject();
+  EXPECT_EQ(logs().back().second.find("FCU: EVENT 7 with args -42-0-"), 0U);
+  uas->update_connection_status(false);
+  missing_file = false;
+  uas->update_connection_status(true);
+  advertise();
+  Peer::elapsed(*plugin, 19);
+  executor.spin_some();
+  EXPECT_EQ(opens.size(), 1U);
+  Peer::elapsed(*plugin, 20);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+}
+
+TEST_F(AutoStatusEventTest, disconnect_cancels_and_rejects_old_completion_and_late_reply)
+{
+  start_auto();
+  const auto generation = Peer::generation(*plugin);
+  hold_read = true;
+  advertise();
+  Peer::elapsed(*plugin, 20);
+  ASSERT_TRUE(spin_until([this]() {return held_read != nullptr;}));
+  uas->update_connection_status(false);
+  uas->update_connection_status(true);
+  auto stale = std::make_unique<px4_events::Decoder>();
+  ASSERT_TRUE(stale->load_json(definitions).empty());
+  Peer::complete(*plugin, generation, std::move(stale));
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  Read::Response late;
+  late.success = true;
+  late.data.assign(general.begin(), general.end());
+  read_service->send_response(*held_read, late);
+  hold_read = false;
+  advertise();
+  Peer::elapsed(*plugin, 19);
+  executor.spin_some();
+  EXPECT_EQ(opens.size(), 1U);
+  Peer::elapsed(*plugin, 20);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+}
+
+TEST_F(AutoStatusEventTest, concurrent_completion_and_disconnect_cannot_leave_decoder_active)
+{
+  start_auto();
+  const auto generation = Peer::generation(*plugin);
+  auto decoder = std::make_unique<px4_events::Decoder>();
+  ASSERT_TRUE(decoder->load_json(definitions).empty());
+  std::promise<void> release;
+  auto ready = release.get_future();
+  std::thread completion([this, generation, decoder = std::move(decoder), &ready]() mutable {
+      ready.wait();
+      Peer::complete(*plugin, generation, std::move(decoder));
+    });
+  release.set_value();
+  uas->update_connection_status(false);
+  completion.join();
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+}
+
 }  // namespace
 }  // namespace uas
 }  // namespace mavros
@@ -383,7 +709,23 @@ int main(int argc, char ** argv)
     "/test_event_auto_invalid/sys:\n"
     "  ros__parameters:\n"
     "    event_decoding_mode: auto\n"
-    "    event_metadata_file: /file/that/does/not/exist\n";
+    "    event_metadata_file: /file/that/does/not/exist\n"
+    "/test_event_auto_zero/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_download_delay: 0.0\n"
+    "/test_event_auto_negative/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_download_delay: -1.0\n"
+    "/test_event_auto_infinite/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_download_delay: .inf\n"
+    "/test_event_auto_large/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_download_delay: 1.0e+300\n";
   mavros::px4_events::TemporaryMetadata file(parameters, ".yaml");
   const char * ros_args[] = {"mavros-status-event-test", "--ros-args", "--params-file",
     file.path.c_str()};

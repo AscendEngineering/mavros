@@ -30,6 +30,7 @@ The following identifiers are planned, not existing public parameters.
 | `event_metadata_file` | Accept a local JSON or XZ-compressed JSON path in `local` mode only. A nonempty path in another mode is invalid. |
 | Automatic source | Use firmware-advertised metadata locations and identity. Do not substitute definitions from current PX4 master or an unrelated local file. |
 | Download delay | Wait 20 seconds after FCU connection before a full automatic download. This delay does not apply to cache validation. |
+| `event_metadata_download_delay` | Default `20.0` seconds, finite and nonnegative, read-only after startup. Applies to automatic FTP acquisition; zero permits starting as soon as discovery succeeds. |
 | Transport | MAVLink FTP only initially; no HTTP/HTTPS downloads, including advertised fallbacks. Report unsupported advertised transports and retain raw logging. |
 | Transfer pacing | No added pacing. Only one request may be outstanding; send the next read immediately after the previous successful response. No read-interval parameter is planned. |
 | Transfer and recovery controls | One retry after explicit EBUSY per operation, with bounded backoff. Bound service waits, file sizes, progress, and complete acquisition attempts; no fixed total acquisition deadline. Stop on uncertain failures. |
@@ -173,9 +174,12 @@ Resolve these in the relevant stage rather than silently selecting defaults:
    representation, storage layout, checksum details, limits, and eviction.
    Configuration defaults, validation flow, atomic writes, reconnect behavior,
    and persistence-failure behavior are agreed above.
-4. Local resource limits are fixed at 1 MiB compressed input, 8 MiB JSON, and
-   64 MiB XZ working memory. The file helper reuses 1 MiB for referenced XZ files
-   and 8 MiB for plain JSON; decompression remains in the existing loader.
+4. Local resource limits are fixed at 1 MiB compressed input and 8 MiB JSON.
+   XZ Embedded single-call decoding uses exact-sized output as its dictionary;
+   there is no separate allocation driven by the advertised dictionary size.
+   Validate the XZ index before allocation and require stream end, exact output,
+   complete input consumption, and integrity verification afterward. The file
+   helper reuses 1 MiB for referenced XZ files and 8 MiB for plain JSON.
    Cache storage limits and automatic limit configurability remain open.
 5. Dependency verification: the sibling `libevents_vendor` package and pinned
    revision are recorded below. Dependency build/install/consumer validation
@@ -313,6 +317,40 @@ handlers, target filtering, raw output in automatic mode, invalid automatic
 configuration, and zero discovery requests in disabled/local/non-PX4 modes.
 Builds and test execution require the user's explicit request and remain pending.
 
+### Stage 6, patch C: system-status runtime wiring
+
+Scope: small lifecycle/advertisement/EVENT hooks in `sys_status.cpp`, focused
+plugin tests, test linkage, and configuration documentation. Persistent cache
+work remains stage 7. Discovery and acquisition retain their existing ownership
+of command/FTP operations and validation; no transfer logic moves into sys.
+
+- Declare read-only `event_metadata_download_delay`, default 20.0 seconds.
+  Automatic mode rejects nonfinite/negative values without stopping MAVROS.
+  Compare elapsed steady-clock seconds, avoiding conversion overflow for large
+  finite values. Zero is valid. Start discovery immediately on PX4 connection;
+  start acquisition only after both the delay and accepted advertisement.
+- Share a start gate between the timer and both advertisement handlers. Start
+  at most one acquisition per connection; internal retries retain their budget.
+  Cancel the startup timer once its delay has elapsed; a later advertisement
+  can start acquisition without polling indefinitely.
+- Invalidate the connection generation before cancelling on disconnect, clear
+  automatic definitions, and reject old completions/timer callbacks. Reconnect
+  repeats discovery and the delay until cache reuse is implemented. Local
+  definitions remain loaded. No early-event buffering or replay is added.
+- Protect decoder replacement and connection state with one recursive mutex:
+  acquisition setup/cancellation can complete inline and re-enter its owner.
+  Completion checks generation, connection, and PX4 eligibility before install.
+  Owner callbacks use weak plugin references. Diagnostic callbacks capture the
+  logger rather than a raw plugin pointer.
+- EVENT handling takes a shared decoder snapshot under that mutex and decodes
+  after releasing it. Definitions are immutable after installation; an existing
+  snapshot stays alive across disconnect. Raw StatusEvent publication is unchanged.
+- Focused tests cover the default delay using a synthetic clock (no override),
+  late/legacy advertisements, explicitly configured zero delay, invalid/large
+  delay values, once-per-connection failure, reconnect/cancel/stale replies,
+  concurrent completion/disconnect, local-mode lifetime, and raw topic fields.
+  Source formatting/lint checks do not replace pending build/runtime validation.
+
 ### Stage 6, patch B: isolated two-file acquisition helper
 
 Scope: `px4_events/acquisition.hpp/.cpp`, focused mock-service tests, CMake
@@ -436,4 +474,7 @@ implementation from planned work, and report skipped or failing checks.
 | 5, rejection responses | Busy-operation and duplicate-open exceptions replaced with unsuccessful EBUSY responses, leaving shared operation/session state untouched. Existing logging retained. Two focused tests added. Existing late-response/reset behavior intentionally retained. | Build and test execution pending; this change alone does not establish safe automatic recovery. |
 | 6, patch A | Earlier isolated single-file downloader; now folded into acquisition, with the separate source/header/test removed. | User reported a successful build and zero test errors/failures before consolidation. |
 | 6, patch B | One acquisition class owns FTP transfers, two-file validation/retries, one timer/mutex, and one owner completion. Shared bounded in-memory loading and consolidated tests remain. No runtime wiring or cache. | Build and test execution pending after consolidation. |
-| 6 integration, 7–9 | Not implemented in this MAVROS branch. | Not run. |
+| 6, patch C | Runtime wiring added with delayed once-per-connection acquisition, generation guards, shared decoder snapshots, and disconnect cancellation. Local-mode lifetime and raw publication preserved. | Focused source formatting/lint checks; build and test execution pending for this patch. |
+| XZ dependency replacement | Replace runtime liblzma with pinned `xz_embedded_vendor`. New isolated XZ helper validates a single-stream index, caps summed output at 8 MiB, allocates exact output, and requires stream end, matching size, complete input consumption, and integrity checks. Single-call mode avoids a separate advertised-size dictionary. Existing liblzma fixture encoders remain test-only. No FTP/discovery/runtime-hook changes in this patch. | Scoped uncrustify/cpplint, package XML parsing, source-archive checksum, and diff whitespace checks passed. Test-source updates, replacement builds, sanitizer checks, and real-file measurements with the replacement are deferred to the next stage. Earlier liblzma measurements and vehicle tests are not validation of the new implementation. |
+| Bitfield output | Compact all-bits-set masks only for PX4's `navigation_mode_group_t` argument named `modes`. Preserve named flags and combine unknown set bits into one width-aware hexadecimal remainder. Retain zero as `0`, ordinary enum formatting, raw arguments, and the raw ROS topic. Use per-render enum overrides without modifying libevents or shared definitions. | Focused tests added/updated for PX4 scope, specific/zero/all masks, multiple simultaneous overrides, unknown remainders, and 64-bit flags/custom separators. Standalone formatting/lint and diff whitespace checks passed; no build or unit-test execution in this patch. |
+| 7–9 | Cache, vehicle validation, and upstream handoff remain. | Not run. |
