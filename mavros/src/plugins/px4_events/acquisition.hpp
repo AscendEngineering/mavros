@@ -35,6 +35,8 @@ namespace mavros
 namespace px4_events
 {
 
+class MetadataCache;
+
 // The caller owns PX4/mode gating, the startup delay, and connection lifecycle.
 class Acquisition : public std::enable_shared_from_this<Acquisition>
 {
@@ -47,11 +49,17 @@ public:
   };
   using Callback = std::function<void (Result)>;
 
+  // An omitted cache preserves download-only behavior. Cache access performs
+  // bounded synchronous local I/O in its callback group; no worker is added.
   static std::shared_ptr<Acquisition> create(
-    const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error = {});
+    const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error = {},
+    std::shared_ptr<const MetadataCache> cache = {});
   ~Acquisition();
-  // Starts immediately; false leaves existing work untouched.
-  bool start(const MetadataFile & general, Callback callback);
+  // Schedules cache lookup. False leaves existing work untouched. With the
+  // download gate closed, misses wait without starting FTP service deadlines.
+  bool start(const MetadataFile & general, Callback callback, bool downloads_allowed = true);
+  // Release the owner's connection-based startup gate; performs no I/O inline.
+  void allow_downloads();
   // Ignores late service replies and sends no cleanup/recovery requests.
   void cancel();
 
@@ -61,18 +69,21 @@ private:
   using Open = mavros_msgs::srv::FileOpen;
   using Read = mavros_msgs::srv::FileRead;
   using Close = mavros_msgs::srv::FileClose;
-  enum class Phase { Idle, Services, Open, Read, Close, Retry };
+  enum class Phase { Idle, Cache, DownloadWait, Services, Open, Read, Close, Retry };
   enum class File { General, Events };
   struct Completion { Callback callback; Result result; };
   static constexpr auto WAIT_TIMEOUT = std::chrono::seconds(10);
   static constexpr auto BUSY_BACKOFF = std::chrono::seconds(2);
   static constexpr size_t CHUNK_SIZE = 239;
 
-  Acquisition(const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error);
+  Acquisition(
+    const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error,
+    std::shared_ptr<const MetadataCache> cache);
   void initialize();
   void tick(Clock::time_point now);
   // State helpers require mutex_; the sole owner callback runs outside it.
   void begin_file_locked(const MetadataFile & file);
+  void begin_download_locked();
   void dispatch_locked();
   template<class Service>
   void send_locked(
@@ -85,6 +96,7 @@ private:
   void close_reply_locked(const Close::Response & response);
   void stop_locked(const std::string & reason, bool uncertain);
   void file_finished_locked(const std::string & close_error = "", bool uncertain = false);
+  void save_cache_locked() const;
   void clear_pending_locked();
   void fail_locked(
     const std::string & reason, bool retryable, bool uncertain,
@@ -94,6 +106,7 @@ private:
 
   rclcpp::Node::SharedPtr node_;
   Decoder::ErrorCallback report_error_;
+  std::shared_ptr<const MetadataCache> cache_;
   rclcpp::CallbackGroup::SharedPtr group_;
   rclcpp::Client<Open>::SharedPtr open_;
   rclcpp::Client<Read>::SharedPtr read_;
@@ -108,6 +121,8 @@ private:
   bool busy_retried_{false};
   bool opened_{false};
   bool retryable_{false};
+  bool from_cache_{false};
+  bool downloads_allowed_{true};
   size_t limit_{0};
   size_t size_{0};
   size_t requested_{0};

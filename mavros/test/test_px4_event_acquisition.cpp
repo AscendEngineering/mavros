@@ -18,6 +18,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -29,6 +32,7 @@
 #include <vector>
 
 #include "../src/plugins/px4_events/acquisition.hpp"
+#include "../src/plugins/px4_events/cache.hpp"
 
 namespace mavros
 {
@@ -38,6 +42,12 @@ namespace px4_events
 class AcquisitionTestPeer
 {
 public:
+  static bool idle(Acquisition & acquisition)
+  {
+    std::lock_guard<std::mutex> lock(acquisition.mutex_);
+    return acquisition.phase_ == Acquisition::Phase::Idle && acquisition.timer_->is_canceled();
+  }
+
   static bool waiting_retry(Acquisition & acquisition)
   {
     std::lock_guard<std::mutex> lock(acquisition.mutex_);
@@ -85,6 +95,7 @@ protected:
     "1":{"name":"test","message":"Decoded event"}}}}}}})";
   std::string events = definitions;
   std::string general;
+  MetadataFile general_file{};
   std::string general_path = "general.json";
   std::string event_path = "events.json";
   std::string hold_read;
@@ -195,7 +206,7 @@ protected:
     return done();
   }
 
-  void start(bool compressed = false, bool bad_general_crc = false)
+  void prepare(bool compressed = false)
   {
     general_path = compressed ? "general.json.xz" : "general.json";
     event_path = compressed ? "events.json.xz" : "events.json";
@@ -207,15 +218,291 @@ protected:
       event_path + "\",\"fileCrc\":" + std::to_string(metadata_crc32(events)) + "}]}";
     json.append(general_padding, ' ');
     general = compressed ? compress(json) : json;
+    general_file = metadata_file("mftp://" + general_path, metadata_crc32(json));
+  }
+
+  void start_prepared(bool bad_general_crc = false)
+  {
     result.reset();
+    auto advertised = general_file;
+    advertised.crc ^= bad_general_crc ? 1U : 0U;
     ASSERT_TRUE(acquisition->start(
-        metadata_file("mftp://" + general_path, metadata_crc32(json) ^ (bad_general_crc ? 1U : 0U)),
+        advertised,
         [this](Acquisition::Result value) {
           ++completions;
           result = std::move(value);
         }));
   }
+
+  void start(bool compressed = false, bool bad_general_crc = false)
+  {
+    prepare(compressed);
+    start_prepared(bad_general_crc);
+  }
 };
+
+class CachedAcquisitionTest : public AcquisitionTest
+{
+protected:
+  std::filesystem::path cache_directory;
+  std::shared_ptr<MetadataCache> cache;
+
+  void SetUp() override
+  {
+    AcquisitionTest::SetUp();
+    char pattern[] = "/tmp/mavros-acquisition-cache-XXXXXX";
+    const auto directory = mkdtemp(pattern);
+    ASSERT_NE(directory, nullptr);
+    cache_directory = directory;
+    cache = std::make_shared<MetadataCache>(cache_directory);
+    acquisition = Acquisition::create(node, {}, cache);
+  }
+
+  void TearDown() override
+  {
+    AcquisitionTest::TearDown();
+    std::error_code error;
+    std::filesystem::remove_all(cache_directory, error);
+  }
+
+  MetadataFile event_file() const
+  {
+    return metadata_file("mftp://" + event_path, metadata_crc32(events));
+  }
+
+  void seed(bool with_general, bool with_events)
+  {
+    if (with_general) {
+      ASSERT_TRUE(cache->save(general_file, MetadataRole::General, general).empty());
+    }
+    if (with_events) {
+      ASSERT_TRUE(cache->save(event_file(), MetadataRole::Events, events).empty());
+    }
+  }
+};
+
+TEST_F(CachedAcquisitionTest, complete_hit_needs_no_ftp_services_and_leaves_timer_cancelled)
+{
+  open_service.reset();
+  read_service.reset();
+  close_service.reset();
+  for (const bool compressed : {false, true}) {
+    events = definitions;
+    prepare(compressed);
+    seed(true, true);
+    start_prepared();
+    ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+    EXPECT_TRUE(result->error.empty());
+    ASSERT_NE(result->decoder, nullptr);
+    const auto decoded = result->decoder->decode(1, 6, {});
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->text, "Decoded event");
+    EXPECT_TRUE(opens.empty());
+    EXPECT_TRUE(closes.empty());
+    EXPECT_TRUE(AcquisitionTestPeer::idle(*acquisition));
+  }
+  EXPECT_EQ(completions, 2U);
+}
+
+TEST_F(CachedAcquisitionTest, cold_download_saves_both_validated_xz_files)
+{
+  start(true);
+  ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+  EXPECT_TRUE(result->error.empty());
+  EXPECT_NE(result->decoder, nullptr);
+  EXPECT_EQ(opens, (std::vector<std::string>{general_path, event_path}));
+  EXPECT_EQ(cache->load(general_file, MetadataRole::General), general);
+  EXPECT_EQ(cache->load(event_file(), MetadataRole::Events), events);
+}
+
+TEST_F(CachedAcquisitionTest, closed_gate_defers_service_timeout_until_downloads_are_allowed)
+{
+  prepare();
+  auto unavailable = std::make_shared<rclcpp::Node>("cache_gate_test", "/cache_gate_unavailable");
+  acquisition = Acquisition::create(unavailable, {}, cache);
+  ASSERT_TRUE(acquisition->start(general_file,
+    [this](Acquisition::Result value) {result = std::move(value);}, false));
+  AcquisitionTestPeer::expire_download(*acquisition);
+  EXPECT_FALSE(result);
+  EXPECT_TRUE(opens.empty());
+  acquisition->allow_downloads();
+  EXPECT_FALSE(result);
+  AcquisitionTestPeer::expire_download(*acquisition);
+  ASSERT_TRUE(result);
+  EXPECT_NE(result->error.find("services unavailable"), std::string::npos);
+}
+
+TEST_F(CachedAcquisitionTest, complete_hit_works_with_download_gate_closed)
+{
+  prepare();
+  seed(true, true);
+  ASSERT_TRUE(acquisition->start(general_file,
+    [this](Acquisition::Result value) {result = std::move(value);}, false));
+  EXPECT_FALSE(result);  // No filesystem work/completion in the caller's handler.
+  ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+  EXPECT_NE(result->decoder, nullptr);
+  EXPECT_TRUE(opens.empty());
+  EXPECT_TRUE(AcquisitionTestPeer::idle(*acquisition));
+}
+
+TEST_F(CachedAcquisitionTest, partial_hits_download_only_the_missing_file)
+{
+  for (const bool general_hit : {true, false}) {
+    std::filesystem::remove_all(cache_directory);
+    opens.clear();
+    closes.clear();
+    prepare();
+    seed(general_hit, !general_hit);
+    start_prepared();
+    ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+    EXPECT_TRUE(result->error.empty());
+    EXPECT_NE(result->decoder, nullptr);
+    const auto missing = general_hit ? event_path : general_path;
+    EXPECT_EQ(opens, (std::vector<std::string>{missing}));
+    EXPECT_EQ(closes, (std::vector<std::string>{missing}));
+    EXPECT_EQ(cache->load(general_file, MetadataRole::General), general);
+    EXPECT_EQ(cache->load(event_file(), MetadataRole::Events), events);
+  }
+}
+
+TEST_F(CachedAcquisitionTest, corrupt_entries_are_downloaded_again_without_spending_retry_budget)
+{
+  prepare();
+  seed(true, true);
+  for (const bool corrupt_general : {true, false}) {
+    const std::string prefix = corrupt_general ? "v1-g-" : "v1-e-";
+    for (const auto & entry : std::filesystem::directory_iterator(cache_directory)) {
+      if (entry.path().filename().string().compare(0, prefix.size(), prefix) == 0) {
+        std::ofstream broken(entry.path(), std::ios::binary);
+        broken << "corrupt cache";
+      }
+    }
+    opens.clear();
+    start_prepared();
+    ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+    EXPECT_TRUE(result->error.empty());
+    EXPECT_NE(result->decoder, nullptr);
+    EXPECT_EQ(opens, (std::vector<std::string>{corrupt_general ? general_path : event_path}));
+    EXPECT_TRUE(AcquisitionTestPeer::idle(*acquisition));
+  }
+}
+
+TEST_F(CachedAcquisitionTest, changed_advertised_checksums_do_not_reuse_old_definitions)
+{
+  prepare();
+  seed(true, true);
+  events.replace(events.find("Decoded event"), std::string("Decoded event").size(),
+          "Updated event");
+  prepare();
+  start_prepared();
+  ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+  EXPECT_EQ(opens, (std::vector<std::string>{general_path, event_path}));
+  ASSERT_NE(result->decoder, nullptr);
+  const auto decoded = result->decoder->decode(1, 6, {});
+  ASSERT_TRUE(decoded);
+  EXPECT_EQ(decoded->text, "Updated event");
+}
+
+TEST_F(CachedAcquisitionTest, successful_general_file_is_saved_even_when_event_read_times_out)
+{
+  hold_read = event_path;
+  start();
+  ASSERT_TRUE(spin_until([this]() {return held_header != nullptr;}));
+  AcquisitionTestPeer::expire_download(*acquisition);
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(result->transport_uncertain);
+  EXPECT_EQ(result->decoder, nullptr);
+  EXPECT_EQ(cache->load(general_file, MetadataRole::General), general);
+  EXPECT_FALSE(cache->load(event_file(), MetadataRole::Events));
+  EXPECT_EQ(opens.size(), 2U);
+  EXPECT_EQ(closes, (std::vector<std::string>{general_path}));
+}
+
+TEST_F(CachedAcquisitionTest, whole_attempt_retry_rechecks_entries_saved_by_another_instance)
+{
+  open_error = EIO;
+  start();
+  ASSERT_TRUE(spin_until([this]() {return AcquisitionTestPeer::waiting_retry(*acquisition);}));
+  MetadataCache other_instance(cache_directory);
+  ASSERT_TRUE(other_instance.save(general_file, MetadataRole::General, general).empty());
+  ASSERT_TRUE(other_instance.save(event_file(), MetadataRole::Events, events).empty());
+  AcquisitionTestPeer::retry(*acquisition);
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(result->error.empty());
+  EXPECT_NE(result->decoder, nullptr);
+  EXPECT_EQ(opens, (std::vector<std::string>{general_path}));
+  EXPECT_TRUE(closes.empty());
+  EXPECT_TRUE(AcquisitionTestPeer::idle(*acquisition));
+}
+
+TEST_F(CachedAcquisitionTest, cancellation_after_general_hit_does_not_cache_late_event_reply)
+{
+  prepare();
+  seed(true, false);
+  hold_read = event_path;
+  start_prepared();
+  ASSERT_TRUE(spin_until([this]() {return held_header != nullptr;}));
+  acquisition->cancel();
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result->decoder, nullptr);
+  const auto before = completions;
+  Read::Response late;
+  late.success = true;
+  late.data.assign(events.begin(), events.end());
+  read_service->send_response(*held_header, late);
+  executor.spin_some();
+  EXPECT_EQ(completions, before);
+  EXPECT_FALSE(cache->load(event_file(), MetadataRole::Events));
+  EXPECT_EQ(opens, (std::vector<std::string>{event_path}));
+  EXPECT_TRUE(closes.empty());
+}
+
+TEST_F(CachedAcquisitionTest, persistence_failure_does_not_turn_valid_acquisition_into_failure)
+{
+  const auto blocked = cache_directory / "not-a-directory";
+  {
+    std::ofstream file(blocked);
+    file << "existing file";
+  }
+  cache = std::make_shared<MetadataCache>(blocked);
+  acquisition = Acquisition::create(node, {}, cache);
+  start();
+  ASSERT_TRUE(spin_until([this]() {return result.has_value();}));
+  EXPECT_TRUE(result->error.empty());
+  EXPECT_FALSE(result->transport_uncertain);
+  ASSERT_NE(result->decoder, nullptr);
+  EXPECT_TRUE(result->decoder->decode(1, 6, {}));
+  EXPECT_EQ(opens.size(), 2U);
+}
+
+TEST_F(CachedAcquisitionTest, unresolved_general_close_still_stops_even_if_events_are_cached)
+{
+  prepare();
+  seed(false, true);
+  hold_close = general_path;
+  start_prepared();
+  ASSERT_TRUE(spin_until([this]() {return held_header != nullptr;}));
+  AcquisitionTestPeer::expire_download(*acquisition);
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(result->transport_uncertain);
+  EXPECT_EQ(result->decoder, nullptr);
+  EXPECT_FALSE(cache->load(general_file, MetadataRole::General));
+  EXPECT_EQ(opens, (std::vector<std::string>{general_path}));
+}
+
+TEST_F(CachedAcquisitionTest, unresolved_final_close_still_allows_validated_event_cache_save)
+{
+  hold_close = event_path;
+  start();
+  ASSERT_TRUE(spin_until([this]() {return held_header != nullptr;}));
+  AcquisitionTestPeer::expire_download(*acquisition);
+  ASSERT_TRUE(result);
+  EXPECT_TRUE(result->error.empty());
+  EXPECT_TRUE(result->transport_uncertain);
+  EXPECT_NE(result->decoder, nullptr);
+  EXPECT_EQ(cache->load(event_file(), MetadataRole::Events), events);
+  EXPECT_EQ(opens.size(), 2U);
+}
 
 TEST_F(AcquisitionTest, validates_plain_and_xz_files_and_returns_working_decoder)
 {

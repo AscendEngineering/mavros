@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "mavros/utils.hpp"
+#include "cache.hpp"
 
 namespace mavros
 {
@@ -28,16 +29,19 @@ namespace px4_events
 {
 
 std::shared_ptr<Acquisition> Acquisition::create(
-  const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error)
+  const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error,
+  std::shared_ptr<const MetadataCache> cache)
 {
-  auto acquisition = std::shared_ptr<Acquisition>(new Acquisition(node, std::move(report_error)));
+  auto acquisition = std::shared_ptr<Acquisition>(
+    new Acquisition(node, std::move(report_error), std::move(cache)));
   acquisition->initialize();
   return acquisition;
 }
 
 Acquisition::Acquisition(
-  const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error)
-: node_(node), report_error_(std::move(report_error))
+  const rclcpp::Node::SharedPtr & node, Decoder::ErrorCallback report_error,
+  std::shared_ptr<const MetadataCache> cache)
+: node_(node), report_error_(std::move(report_error)), cache_(std::move(cache))
 {}
 
 void Acquisition::initialize()
@@ -81,8 +85,9 @@ void Acquisition::clear_pending_locked()
   }
 }
 
-bool Acquisition::start(const MetadataFile & general, Callback callback)
+bool Acquisition::start(const MetadataFile & general, Callback callback, bool downloads_allowed)
 {
+  bool setup_failed = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (phase_ != Phase::Idle || completion_ || !callback) {
@@ -92,17 +97,37 @@ bool Acquisition::start(const MetadataFile & general, Callback callback)
     general_ = general;
     callback_ = std::move(callback);
     file_ = File::General;
+    downloads_allowed_ = downloads_allowed;
     try {
       begin_file_locked(general_);
-      timer_->reset();
+      if (phase_ != Phase::Idle) {
+        timer_->reset();
+      }
     } catch (const std::exception & ex) {
       finish_locked({nullptr, ex.what(), false});
+      setup_failed = true;
     } catch (...) {
       finish_locked({nullptr, "unknown metadata acquisition setup exception", false});
+      setup_failed = true;
     }
   }
-  tick(Clock::now());
+  // Cache access belongs to the acquisition callback group, not the caller's
+  // advertisement handler. Without cache, preserve immediate FTP dispatch.
+  if (!cache_) {
+    tick(Clock::now());
+  } else if (setup_failed) {
+    deliver();
+  }
   return true;
+}
+
+void Acquisition::allow_downloads()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  downloads_allowed_ = true;
+  if (phase_ == Phase::DownloadWait) {
+    begin_download_locked();
+  }
 }
 
 void Acquisition::begin_file_locked(const MetadataFile & file)
@@ -110,6 +135,7 @@ void Acquisition::begin_file_locked(const MetadataFile & file)
   opened_ = false;
   busy_retried_ = false;
   retryable_ = false;
+  from_cache_ = false;
   bytes_.clear();
   error_.clear();
   current_ = metadata_file(file.uri, file.crc);
@@ -119,8 +145,19 @@ void Acquisition::begin_file_locked(const MetadataFile & file)
   const auto & path = current_.ftp_path;
   limit_ = path.size() >= 3 && path.substr(path.size() - 3) == ".xz" ?
     Decoder::MAX_COMPRESSED_BYTES : Decoder::MAX_JSON_BYTES;
-  phase_ = Phase::Services;
-  deadline_ = Clock::now() + WAIT_TIMEOUT;
+  if (cache_) {
+    phase_ = Phase::Cache;
+  } else {
+    begin_download_locked();
+  }
+}
+
+void Acquisition::begin_download_locked()
+{
+  phase_ = downloads_allowed_ ? Phase::Services : Phase::DownloadWait;
+  if (downloads_allowed_) {
+    deadline_ = Clock::now() + WAIT_TIMEOUT;
+  }
 }
 
 void Acquisition::cancel()
@@ -146,6 +183,19 @@ void Acquisition::tick(Clock::time_point now)
         file_ = File::General;
         begin_file_locked(general_);
       }
+      // At most the general and event file can hit consecutively. A miss
+      // enters the owner's download gate before checking FTP service readiness.
+      while (phase_ == Phase::Cache) {
+        const auto role = file_ == File::General ? MetadataRole::General : MetadataRole::Events;
+        if (auto cached = cache_->load(current_, role)) {
+          bytes_ = std::move(*cached);
+          from_cache_ = true;
+          RCLCPP_DEBUG(node_->get_logger(), "PX4 metadata cache hit: %s", current_.uri.c_str());
+          file_finished_locked();
+        } else {
+          begin_download_locked();
+        }
+      }
       if (phase_ == Phase::Services) {
         if (open_->service_is_ready() && read_->service_is_ready() && close_->service_is_ready()) {
           phase_ = Phase::Open;
@@ -157,8 +207,10 @@ void Acquisition::tick(Clock::time_point now)
         if (now >= deadline_) {
           stop_locked("metadata FTP service response timeout", true);
         }
-      } else if (phase_ != Phase::Idle && phase_ != Phase::Retry && now >= next_request_) {
-        dispatch_locked();
+      } else if (phase_ == Phase::Open || phase_ == Phase::Read || phase_ == Phase::Close) {
+        if (now >= next_request_) {
+          dispatch_locked();
+        }
       }
     } catch (const std::exception & ex) {
       stop_locked(ex.what(), true);
@@ -338,6 +390,7 @@ void Acquisition::file_finished_locked(const std::string & close_error, bool unc
         return;
       }
       const auto events = event_metadata_file(json);
+      save_cache_locked();
       file_ = File::Events;
       begin_file_locked(events);
     } else {
@@ -346,12 +399,27 @@ void Acquisition::file_finished_locked(const std::string & close_error, bool unc
       if (!error.empty()) {
         throw std::runtime_error(error);
       }
+      save_cache_locked();
       finish_locked({std::move(decoder), {}, uncertain});
     }
   } catch (const std::exception & ex) {
     fail_locked(ex.what(), false, uncertain, now);
   } catch (...) {
     fail_locked("unknown metadata validation exception", false, uncertain, now);
+  }
+}
+
+void Acquisition::save_cache_locked() const
+{
+  if (!cache_ || from_cache_) {
+    return;
+  }
+  const auto role = file_ == File::General ? MetadataRole::General : MetadataRole::Events;
+  const auto error = cache_->save(current_, role, bytes_);
+  if (!error.empty()) {
+    RCLCPP_WARN(node_->get_logger(),
+          "PX4 metadata cache save failed: %s; retaining validated metadata",
+      error.c_str());
   }
 }
 

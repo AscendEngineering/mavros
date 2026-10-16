@@ -14,6 +14,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <future>
 #include <fstream>
 #include <iterator>
@@ -63,6 +65,12 @@ public:
   {
     plugin.event_acquisition_complete(generation, {std::move(decoder), {}, false});
   }
+
+  static bool startup_timer_cancelled(SystemStatusPlugin & plugin)
+  {
+    std::lock_guard<std::recursive_mutex> lock(plugin.event_mutex);
+    return plugin.event_start_timer && plugin.event_start_timer->is_canceled();
+  }
 };
 }  // namespace std_plugins
 
@@ -72,6 +80,9 @@ namespace
 {
 std::mutex log_mutex;
 std::vector<std::pair<int, std::string>> event_logs;
+// Parameter-file override isolates test storage; it does not change the
+// configured cache-enabled, size-limit, or download-delay defaults.
+std::filesystem::path cache_test_root;
 
 void capture_log(
   const rcutils_log_location_t *, int severity, const char *, rcutils_time_point_value_t,
@@ -86,7 +97,7 @@ void capture_log(
   if (message.find("FCU: ") == 0 || message.find("PX4 event decoding inactive:") == 0 ||
     message.find("PX4 event decoding failed for ID ") == 0 ||
     message.find("PX4 event acquisition failed:") == 0 ||
-    message.find("PX4 event metadata ") == 0)
+    message.find("PX4 event metadata ") == 0 || message.find("PX4 metadata cache ") == 0)
   {
     std::lock_guard<std::mutex> lock(log_mutex);
     event_logs.emplace_back(severity, message);
@@ -103,6 +114,9 @@ protected:
 
   void SetUp() override
   {
+    for (const auto & entry : std::filesystem::directory_iterator(cache_test_root)) {
+      std::filesystem::remove_all(entry.path());
+    }
     previous_handler = rcutils_logging_get_output_handler();
     rcutils_logging_set_output_handler(capture_log);
     std::lock_guard<std::mutex> lock(log_mutex);
@@ -263,7 +277,7 @@ TEST_F(StatusEventTest, disabled_by_default_retains_raw_disabled_severity_behavi
   EXPECT_EQ(plugin->get_node()->get_parameter("event_decoding_mode").as_string(), "disabled");
   EXPECT_TRUE(plugin->get_node()->get_parameter("event_metadata_file").as_string().empty());
   EXPECT_DOUBLE_EQ(plugin->get_node()->get_parameter("event_metadata_download_delay").as_double(),
-          20.0);
+          30.0);
   inject(0x01000003, 8);
   const auto lines = logs();
   ASSERT_EQ(lines.size(), 1u);
@@ -300,12 +314,23 @@ TEST_F(StatusEventTest, decoding_parameters_require_restart)
   EXPECT_TRUE(node->describe_parameter("event_decoding_mode").read_only);
   EXPECT_TRUE(node->describe_parameter("event_metadata_file").read_only);
   EXPECT_TRUE(node->describe_parameter("event_metadata_download_delay").read_only);
+  for (const auto & name : {"event_metadata_cache_enabled", "event_metadata_cache_dir",
+      "event_metadata_cache_max_bytes"})
+  {
+    EXPECT_TRUE(node->describe_parameter(name).read_only);
+  }
   EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_decoding_mode",
           "disabled")).successful);
   EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_file",
           "/other.json")).successful);
   EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_download_delay",
           10.0)).successful);
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_cache_enabled",
+          false)).successful);
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_cache_dir",
+          "/other")).successful);
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("event_metadata_cache_max_bytes",
+          int64_t{1})).successful);
   inject();
   const auto lines = logs();
   ASSERT_EQ(lines.size(), 1u);
@@ -359,8 +384,14 @@ TEST_F(StatusEventTest, auto_mode_requests_metadata_and_keeps_events_raw)
     lines[0].second, "PX4 event metadata advertised: mftp://etc/extras/component_general.json.xz");
   EXPECT_EQ(lines[1].second.find("FCU: EVENT 7 with args -42-0-"), 0U);
   uas->update_connection_status(false);
+  const auto disconnected_lines = logs();
+  ASSERT_EQ(disconnected_lines.size(), 3U);
+  EXPECT_EQ(disconnected_lines.back().first, RCUTILS_LOG_SEVERITY_WARN);
+  EXPECT_EQ(
+    disconnected_lines.back().second,
+    "PX4 event acquisition failed: metadata acquisition cancelled; retaining raw logging");
   route(uas, &message, mavconn::Framing::ok);
-  EXPECT_EQ(logs().size(), 2U);
+  EXPECT_EQ(logs(), disconnected_lines);
   stop_spin();
   EXPECT_EQ(requests->load(), 1U);
 }
@@ -368,6 +399,7 @@ TEST_F(StatusEventTest, auto_mode_requests_metadata_and_keeps_events_raw)
 TEST_F(StatusEventTest, disabled_mode_does_not_request_metadata)
 {
   expect_no_metadata_requests("test_event_disabled");
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
 }
 
 TEST_F(StatusEventTest, auto_mode_accepts_legacy_advertisement_fields)
@@ -392,6 +424,7 @@ TEST_F(StatusEventTest, auto_mode_accepts_legacy_advertisement_fields)
 TEST_F(StatusEventTest, local_mode_does_not_request_metadata)
 {
   expect_no_metadata_requests("test_event_local");
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
 }
 
 TEST_F(StatusEventTest, non_px4_auto_mode_does_not_request_metadata)
@@ -545,6 +578,20 @@ protected:
     return done();
   }
 
+  void seed_cache(bool with_general = true, bool with_events = true)
+  {
+    px4_events::MetadataCache cache(cache_test_root / "cache");
+    if (with_general) {
+      ASSERT_TRUE(cache.save(px4_events::metadata_file("mftp://general.json",
+        px4_events::metadata_crc32(general)), px4_events::MetadataRole::General, general).empty());
+    }
+    if (with_events) {
+      ASSERT_TRUE(cache.save(px4_events::metadata_file("mftp://events.json",
+        px4_events::metadata_crc32(definitions)), px4_events::MetadataRole::Events,
+        definitions).empty());
+    }
+  }
+
   void TearDown() override
   {
     if (plugin) {
@@ -561,13 +608,15 @@ protected:
 TEST_F(AutoStatusEventTest, default_delay_gates_ftp_then_activates_and_preserves_raw_topic)
 {
   start_auto();
+  EXPECT_TRUE(plugin->get_node()->get_parameter("event_metadata_cache_enabled").as_bool());
+  EXPECT_EQ(plugin->get_node()->get_parameter("event_metadata_cache_max_bytes").as_int(), 16777216);
   advertise();
-  Peer::elapsed(*plugin, 19);
+  Peer::elapsed(*plugin, 29);
   executor.spin_some();
   EXPECT_TRUE(opens.empty());
   inject();
   EXPECT_EQ(logs().back().second.find("FCU: EVENT 7 with args -42-0-"), 0U);
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
   EXPECT_EQ(opens, (std::vector<std::string>{"general.json", "events.json"}));
   std::optional<mavros_msgs::msg::StatusEvent> raw;
@@ -594,10 +643,146 @@ TEST_F(AutoStatusEventTest, default_delay_gates_ftp_then_activates_and_preserves
   EXPECT_EQ(logs().back().second.find("FCU: EVENT 7 with args -42-0-"), 0U);
 }
 
+TEST_F(AutoStatusEventTest, warm_cache_activates_before_download_delay_without_ftp_services)
+{
+  start_auto();
+  seed_cache();
+  open_service.reset();
+  read_service.reset();
+  close_service.reset();
+  advertise();
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_TRUE(opens.empty());
+  EXPECT_TRUE(Peer::startup_timer_cancelled(*plugin));
+  inject();
+  EXPECT_EQ(logs().back().second, "FCU: Warning next line");
+}
+
+TEST_F(AutoStatusEventTest, both_partial_hit_directions_wait_for_the_original_download_delay)
+{
+  start_auto();
+  for (const bool general_hit : {true, false}) {
+    std::filesystem::remove_all(cache_test_root / "cache");
+    seed_cache(general_hit, !general_hit);
+    advertise();
+    Peer::elapsed(*plugin, 29);
+    executor.spin_some();
+    EXPECT_TRUE(opens.empty());
+    EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+    Peer::elapsed(*plugin, 30);
+    ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+    EXPECT_EQ(opens, (std::vector<std::string>{general_hit ? "events.json" : "general.json"}));
+    uas->update_connection_status(false);
+    opens.clear();
+    uas->update_connection_status(true);
+  }
+}
+
+TEST_F(AutoStatusEventTest, reconnect_revalidates_saved_metadata_without_another_download)
+{
+  start_auto();
+  advertise();
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  ASSERT_EQ(opens.size(), 2U);
+  uas->update_connection_status(false);
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  opens.clear();
+  uas->update_connection_status(true);
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);  // Need this connection's advertisement.
+  advertise();
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_TRUE(opens.empty());
+}
+
+TEST_F(AutoStatusEventTest, disabled_cache_ignores_existing_entries_and_does_not_save)
+{
+  start_auto("test_event_auto_cache_off");
+  seed_cache();
+  advertise();
+  Peer::elapsed(*plugin, 29);
+  executor.spin_some();
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  EXPECT_TRUE(opens.empty());
+  std::filesystem::remove_all(cache_test_root / "cache");
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_EQ(opens.size(), 2U);
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
+}
+
+TEST_F(AutoStatusEventTest, zero_cache_limit_reports_error_but_still_downloads_and_decodes)
+{
+  start_auto("test_event_auto_cache_zero");
+  const auto lines = logs();
+  ASSERT_EQ(lines.size(), 1U);
+  EXPECT_EQ(lines[0].first, RCUTILS_LOG_SEVERITY_ERROR);
+  EXPECT_NE(lines[0].second.find("must be positive"), std::string::npos);
+  advertise();
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_EQ(opens.size(), 2U);
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
+}
+
+TEST_F(AutoStatusEventTest, negative_cache_limit_disables_only_persistence)
+{
+  start_auto("test_event_auto_cache_negative");
+  advertise();
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_EQ(opens.size(), 2U);
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
+}
+
+TEST_F(AutoStatusEventTest, unavailable_cache_directory_warns_but_decoding_remains_available)
+{
+  {
+    std::ofstream blocked(cache_test_root / "blocked");
+    blocked << "existing file";
+  }
+  start_auto("test_event_auto_cache_blocked");
+  advertise();
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  const auto lines = logs();
+  EXPECT_TRUE(std::any_of(lines.begin(), lines.end(), [](const auto & line) {
+      return line.first == RCUTILS_LOG_SEVERITY_WARN &&
+             line.second.find("PX4 metadata cache save failed:") == 0;
+    }));
+}
+
+TEST_F(AutoStatusEventTest, small_positive_cache_limit_is_honored_without_disabling_decoding)
+{
+  start_auto("test_event_auto_cache_tiny");
+  EXPECT_EQ(plugin->get_node()->get_parameter("event_metadata_cache_max_bytes").as_int(), 1);
+  advertise();
+  Peer::elapsed(*plugin, 30);
+  ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
+  EXPECT_FALSE(std::filesystem::exists(cache_test_root / "cache"));
+  const auto lines = logs();
+  EXPECT_TRUE(std::any_of(lines.begin(), lines.end(), [](const auto & line) {
+      return line.first == RCUTILS_LOG_SEVERITY_WARN &&
+             line.second.find("exceeds configured cache limit") != std::string::npos;
+    }));
+}
+
+TEST_F(AutoStatusEventTest, disconnect_before_scheduled_cache_lookup_prevents_activation)
+{
+  start_auto();
+  seed_cache();
+  advertise();
+  uas->update_connection_status(false);
+  executor.spin_some();
+  EXPECT_EQ(Peer::decoder(*plugin), nullptr);
+  EXPECT_TRUE(opens.empty());
+}
+
 TEST_F(AutoStatusEventTest, late_legacy_advertisement_starts_after_elapsed_delay)
 {
   start_auto();
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   executor.spin_some();
   EXPECT_TRUE(opens.empty());
   advertise(true);
@@ -618,7 +803,7 @@ TEST_F(AutoStatusEventTest, terminal_failure_stays_raw_until_next_connection)
   start_auto();
   missing_file = true;
   advertise();
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   ASSERT_TRUE(spin_until([this]() {
       const auto lines = logs();
       return std::any_of(lines.begin(), lines.end(), [](const auto & line) {
@@ -636,10 +821,10 @@ TEST_F(AutoStatusEventTest, terminal_failure_stays_raw_until_next_connection)
   missing_file = false;
   uas->update_connection_status(true);
   advertise();
-  Peer::elapsed(*plugin, 19);
+  Peer::elapsed(*plugin, 29);
   executor.spin_some();
   EXPECT_EQ(opens.size(), 1U);
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
 }
 
@@ -649,7 +834,7 @@ TEST_F(AutoStatusEventTest, disconnect_cancels_and_rejects_old_completion_and_la
   const auto generation = Peer::generation(*plugin);
   hold_read = true;
   advertise();
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   ASSERT_TRUE(spin_until([this]() {return held_read != nullptr;}));
   uas->update_connection_status(false);
   uas->update_connection_status(true);
@@ -663,10 +848,10 @@ TEST_F(AutoStatusEventTest, disconnect_cancels_and_rejects_old_completion_and_la
   read_service->send_response(*held_read, late);
   hold_read = false;
   advertise();
-  Peer::elapsed(*plugin, 19);
+  Peer::elapsed(*plugin, 29);
   executor.spin_some();
   EXPECT_EQ(opens.size(), 1U);
-  Peer::elapsed(*plugin, 20);
+  Peer::elapsed(*plugin, 30);
   ASSERT_TRUE(spin_until([this]() {return Peer::decoder(*plugin) != nullptr;}));
 }
 
@@ -694,7 +879,17 @@ TEST_F(AutoStatusEventTest, concurrent_completion_and_disconnect_cannot_leave_de
 
 int main(int argc, char ** argv)
 {
+  char pattern[] = "/tmp/mavros-status-cache-XXXXXX";
+  const auto directory = mkdtemp(pattern);
+  if (!directory) {
+    return 1;
+  }
+  mavros::uas::cache_test_root = directory;
+  const auto root = std::string(directory);
   const std::string parameters =
+    "/**/sys:\n"
+    "  ros__parameters:\n"
+    "    event_metadata_cache_dir: '" + root + "/cache'\n" +
     "/test_event_local/sys:\n"
     "  ros__parameters:\n"
     "    event_decoding_mode: local\n"
@@ -725,7 +920,27 @@ int main(int argc, char ** argv)
     "/test_event_auto_large/sys:\n"
     "  ros__parameters:\n"
     "    event_decoding_mode: auto\n"
-    "    event_metadata_download_delay: 1.0e+300\n";
+    "    event_metadata_download_delay: 1.0e+300\n"
+    "/test_event_auto_cache_off/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_cache_enabled: false\n"
+    "/test_event_auto_cache_zero/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_cache_max_bytes: 0\n"
+    "/test_event_auto_cache_negative/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_cache_max_bytes: -1\n"
+    "/test_event_auto_cache_tiny/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_cache_max_bytes: 1\n"
+    "/test_event_auto_cache_blocked/sys:\n"
+    "  ros__parameters:\n"
+    "    event_decoding_mode: auto\n"
+    "    event_metadata_cache_dir: '" + root + "/blocked'\n";
   mavros::px4_events::TemporaryMetadata file(parameters, ".yaml");
   const char * ros_args[] = {"mavros-status-event-test", "--ros-args", "--params-file",
     file.path.c_str()};
@@ -733,5 +948,7 @@ int main(int argc, char ** argv)
   ::testing::InitGoogleTest(&argc, argv);
   const auto result = RUN_ALL_TESTS();
   rclcpp::shutdown();
+  std::error_code error;
+  std::filesystem::remove_all(mavros::uas::cache_test_root, error);
   return result;
 }

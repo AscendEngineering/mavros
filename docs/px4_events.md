@@ -3,8 +3,8 @@
 The system-status plugin can translate PX4 MAVLink EVENT messages using libevents
 and either a local firmware-matching definition file or automatically acquired
 definitions. Decoding is disabled by default. Automatic mode retrieves the
-firmware-advertised metadata through MAVROS FTP services. Persistent caching is
-not implemented yet.
+firmware-advertised metadata through MAVROS FTP services and reuses validated
+persistent cache entries by default.
 
 ## Configuration
 
@@ -16,7 +16,10 @@ startup; restart MAVROS to change them.
 | --- | --- | --- |
 | `event_decoding_mode` | `disabled` | `disabled` keeps existing raw logging and does no metadata I/O. `local` loads `event_metadata_file` once at startup. `auto` discovers and retrieves definitions from a connected PX4 FCU. Other values leave decoding inactive and produce a configuration error. |
 | `event_metadata_file` | Empty string | Required in `local` mode and must be empty otherwise. An absolute path to readable JSON or `.xz`-compressed JSON inside the MAVROS process's filesystem. Use definitions from the vehicle's exact firmware; local mode cannot verify firmware identity. |
-| `event_metadata_download_delay` | `20.0` seconds | In `auto` mode, wait this long from FCU connection before starting FTP acquisition. Must be finite and nonnegative; `0.0` allows immediate retrieval after discovery. Invalid values leave automatic decoding inactive. |
+| `event_metadata_download_delay` | `30.0` seconds | In `auto` mode, wait this long from FCU connection before starting FTP downloads. Cache hits bypass this delay. Must be finite and nonnegative; `0.0` allows immediate retrieval after discovery. Invalid values leave automatic decoding inactive. |
+| `event_metadata_cache_enabled` | `true` | Use persistent cache in `auto` mode. `false` skips cache reads and writes. Disabled/local decoding ignores cache settings. |
+| `event_metadata_cache_dir` | Empty string | Empty selects `$HOME/.cache/mavros/px4_events`; otherwise use the supplied directory. Missing HOME disables persistence with a warning. Missing directories are created on save. |
+| `event_metadata_cache_max_bytes` | `16777216` (16 MiB) | Best-effort bound on finalized cache entries. Zero/negative values report an error and disable only persistence; automatic acquisition and decoding remain available. Entries larger than the limit are not saved. |
 
 Example parameter-file section (replace the path with your own file):
 
@@ -42,7 +45,8 @@ than the EVENT message's 40 argument bytes are rejected before activation.
 
 An invalid configuration or file produces one setup error and leaves the
 vehicle connection and raw event logging operational. Correct the configuration
-or file and restart MAVROS. Successful loading does not prove the definitions
+or file and restart MAVROS. Invalid cache settings or persistence failures do
+not disable automatic acquisition/decoding. Successful local loading does not prove the definitions
 match the connected firmware.
 
 ## Automatic discovery and retrieval
@@ -70,9 +74,15 @@ failure, or disconnect. A failure warns once for that connection; reconnect
 clears the descriptor, resets the budget, and ignores old service callbacks.
 
 Discovery starts promptly after connection, independently of the download delay.
-Disabled/local modes and non-PX4 vehicles send no discovery requests. Once the
-delay has elapsed and an advertisement is available, acquisition downloads the
-general metadata and referenced event definitions. JSON/XZ files are bounded,
+The default 30-second delay places optional acquisition after the fixed mission,
+rally-point, and geofence startup pulls (15, 20, and 25 seconds). It does not
+guarantee those operations or their retries have finished.
+Disabled/local modes and non-PX4 vehicles send no discovery requests. Once an
+advertisement is available, acquisition checks the general and event caches in
+its callback group. A complete hit activates without FTP services or the download
+delay. A partial hit downloads only the missing file, after the connection-based
+delay; service-wait timeouts do not run while waiting for permission to download.
+JSON/XZ files are bounded,
 checksums are verified, and definitions are parsed before the decoder is
 activated. Only MAVLink FTP locations are supported; no HTTP fallback is used.
 
@@ -87,10 +97,36 @@ final close. Failures retain raw logging.
 
 Events received before activation are logged raw, without buffering or replay.
 On disconnect, pending work is cancelled and automatic definitions are cleared.
-Late results from an earlier connection cannot activate a decoder. Until caching
-is implemented, reconnecting repeats discovery and the configured download delay.
+Late results from an earlier connection cannot activate a decoder. Reconnecting
+repeats discovery and validates cache entries against the new advertisement;
+matching entries bypass downloads and their delay.
 Local-mode definitions remain loaded across disconnects. An EVENT already using
 a decoder may finish safely while the plugin clears its active reference.
+
+## Persistent cache
+
+Each entry stores its role, original advertised URI/checksum, and original file
+bytes together. Cache hits recheck identity, checksum, resource limits, and
+parsing before use. General checksums cover uncompressed JSON; event checksums
+cover transferred bytes, including XZ compression. Connecting to the same vehicle
+alone is insufficient to reuse definitions after a firmware update.
+
+Validated downloads are saved independently, so general metadata can be reused
+even if event retrieval fails. Unique owner-only temporary files and atomic rename
+publish complete entries. Missing/unreadable/corrupt entries are misses; save
+failures warn and retain valid in-memory definitions. Cache hits are logged at
+DEBUG, and activation retains the existing INFO message.
+
+Oldest-saved finalized entries are evicted toward the size limit. Concurrent
+instances can share the directory without a lock; temporary overages, duplicate
+downloads, and extra misses are acceptable. Temporary and unrelated files are
+not evicted. A crash can leave an ignored temporary file; atomic publication is
+not a power-loss durability guarantee. Already loaded definitions survive disk
+eviction for the rest of the connection.
+
+Container deployments should bind-mount or otherwise persist the configured
+directory to reuse cache across container replacement. To opt out while retaining
+automatic downloads, set `event_metadata_cache_enabled: false`.
 
 ## Output and verification
 

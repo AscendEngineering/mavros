@@ -29,13 +29,14 @@ The following identifiers are planned, not existing public parameters.
 | Parameter changes | Require a restart. Reject runtime changes to decoding configuration with an explanatory reason. |
 | `event_metadata_file` | Accept a local JSON or XZ-compressed JSON path in `local` mode only. A nonempty path in another mode is invalid. |
 | Automatic source | Use firmware-advertised metadata locations and identity. Do not substitute definitions from current PX4 master or an unrelated local file. |
-| Download delay | Wait 20 seconds after FCU connection before a full automatic download. This delay does not apply to cache validation. |
-| `event_metadata_download_delay` | Default `20.0` seconds, finite and nonnegative, read-only after startup. Applies to automatic FTP acquisition; zero permits starting as soon as discovery succeeds. |
+| Download delay | Wait 30 seconds after FCU connection before a full automatic download, after the fixed mission/rally/geofence startup pulls at 15/20/25 seconds. This staggers optional work but does not guarantee an idle FCU. The delay does not apply to cache validation. |
+| `event_metadata_download_delay` | Default `30.0` seconds, finite and nonnegative, read-only after startup. Applies to automatic FTP acquisition; zero permits starting as soon as discovery succeeds. |
 | Transport | MAVLink FTP only initially; no HTTP/HTTPS downloads, including advertised fallbacks. Report unsupported advertised transports and retain raw logging. |
 | Transfer pacing | No added pacing. Only one request may be outstanding; send the next read immediately after the previous successful response. No read-interval parameter is planned. |
 | Transfer and recovery controls | One retry after explicit EBUSY per operation, with bounded backoff. Bound service waits, file sizes, progress, and complete acquisition attempts; no fixed total acquisition deadline. Stop on uncertain failures. |
 | `event_metadata_cache_enabled` | Default `true`; applies to automatic mode. Disabled decoding adds no cache-related network traffic. |
-| `event_metadata_cache_dir` | Empty selects the standard user cache location; an explicit directory overrides it. Exact automatic path resolution remains to be specified. |
+| `event_metadata_cache_dir` | Empty selects `$HOME/.cache/mavros/px4_events`; an explicit directory overrides it. No XDG override. If HOME is unavailable, report the problem and continue without persistence. |
+| `event_metadata_cache_max_bytes` | Default `16777216` (16 MiB), restart-only. Best-effort bound on finalized entry content; not a filesystem quota. Zero/negative values report a configuration error and disable only persistence. A valid positive limit smaller than an entry skips saving that entry without disabling decoding. |
 
 Reject invalid decoding configuration without stopping the MAVROS vehicle
 connection: report a clear configuration error, leave decoding inactive, and
@@ -85,7 +86,7 @@ Connecting to the same vehicle is insufficient proof: firmware can change.
 On disconnect, cancel pending acquisition, invalidate active definitions, and
 retain the persistent cache. On reconnect, validate the advertised identity and
 reuse matching cached definitions. Cache validation is not subject to the
-20-second full-download delay when no download is needed.
+30-second full-download delay when no download is needed.
 
 Cache both the general metadata file and the event definitions. Request the
 firmware's metadata advertisement immediately after connection. If its advertised
@@ -100,7 +101,27 @@ writes. Corrupt or mismatched cache entries must not be activated; reacquire the
 necessary files under the normal acquisition policy. If disk persistence fails,
 warn clearly and continue decoding with validated definitions in memory.
 
-Bound disk usage; storage layout, exact limits, and eviction details remain open.
+Bound finalized entry sizes using the configurable limit above. Scan once per
+save, sort entries oldest-saved first, and delete one at a time until the
+snapshot estimate fits. Count bytes freed only after successful removal. Ignore
+unrelated files, symlinks, directories, and temporary files. Concurrent saves may
+temporarily exceed the limit or cause extra cache misses; the next save rechecks.
+No interprocess lock or download reservation is introduced. Duplicate downloads
+are acceptable, and active in-memory definitions are unaffected by eviction.
+
+Each versioned cache entry contains the full identity (role, original URI, and
+advertised checksum) plus original JSON/XZ bytes in one file. Deterministic
+filenames use role, a URI hash, and the advertised checksum; always compare the
+full stored identity, so filename collisions cause misses rather than reuse of
+unrelated definitions. Revalidate checksum and parsing on every load.
+
+Publish with a unique owner-only `mkstemp` file in the cache directory, checked
+writes/close, and same-directory atomic rename. Readers never consume temporary
+files. Remove our temporary file on ordinary failures; do not delete another
+instance's temporary files. A process crash can leave an ignored temporary file.
+Atomic publication does not promise power-loss durability; invalid entries are
+misses and can be reacquired. No fsync or global cache coordination is planned.
+
 Keep cache settings under the same plugin node and require restart for changes.
 Container deployments must persist the configured cache directory with a volume
 or bind mount if cache reuse is expected after container replacement.
@@ -113,7 +134,7 @@ MAVROS parameter values are a different concern: the parameter plugin clears
 them on disconnect and schedules another pull after reconnect. They are mutable
 vehicle state, whereas event definitions describe firmware. Do not change the
 parameter plugin or attach metadata acquisition to its completion. The
-20-second delay provides a head start, not a guarantee that parameter loading
+30-second delay provides a head start, not a guarantee that parameter loading
 has finished.
 
 Bound download size, decompressed metadata size, and cache resource use. Begin
@@ -126,7 +147,7 @@ Use reads of at most 239 bytes, with no burst reads initially. Allow only one
 outstanding request. Send the next read immediately after the previous response
 has completed successfully, matching normal MAVROS FTP behavior. The previously
 proposed 250 ms/100 ms pacing and read-interval parameter are removed by user
-agreement. Keep the 20-second cold-download delay; cache hits avoid the download
+agreement. Keep the 30-second cold-download delay; cache hits avoid the download
 and that wait. Validate telemetry/command responsiveness and concurrent FTP use
 on the vehicle before upstream submission; one outstanding request is not a
 bandwidth reservation or a guarantee of fair link sharing.
@@ -165,15 +186,15 @@ external FTP consumers.
 Resolve these in the relevant stage rather than silently selecting defaults:
 
 1. Startup delay configuration: exact parameter name and validation bounds.
-   The default remains 20 seconds. No read-interval parameter is planned.
+   The default is 30 seconds. No read-interval parameter is planned.
 2. Outer acquisition integration: implement the three-attempt policy without
    retrying uncertain failures. The file helper has one EBUSY retry per operation,
    two-second backoff, and ten-second service waits. No total deadline is planned;
    FTP's own wire-operation deadlines and late-response behavior are unchanged.
-3. Cache implementation: exact automatic directory resolution, identity/key
-   representation, storage layout, checksum details, limits, and eviction.
-   Configuration defaults, validation flow, atomic writes, reconnect behavior,
-   and persistence-failure behavior are agreed above.
+3. Cache implementation: implement the agreed directory, identity, single-entry
+   storage, limits, atomic publication, and lock-free best-effort eviction above.
+   Then integrate acquisition, startup/reconnect handling, parameters, and docs
+   as separate reviewable patches.
 4. Local resource limits are fixed at 1 MiB compressed input and 8 MiB JSON.
    XZ Embedded single-call decoding uses exact-sized output as its dictionary;
    there is no separate allocation driven by the advertised dictionary size.
@@ -217,7 +238,7 @@ to edit files, build, commit, push, or post upstream.
 | 3. Local mode | Connect validated local JSON/XZ loading to the existing EVENT logging path, preserving severity and argument details. | Disabled behavior and raw ROS publication remain unchanged; successful decoding produces one readable log line; failures retain raw output. Severity, protocol/summary arguments, and invalid-file fallback have focused coverage. |
 | 4. Metadata discovery | First add isolated general-metadata parsing and checksum helpers; then separately connect firmware-advertised discovery to the sys plugin. | Advertised FTP locations and checksums are represented correctly; missing, malformed, ambiguous, or unsupported metadata is rejected. Runtime request/reconnect behavior is reviewed in the following patch. |
 | 5. FTP rejection responses | Replace busy-path exceptions with unsuccessful EBUSY responses in a separately reviewable change. Leave existing late-response/reset behavior unchanged; introduce no reservation or general scheduler. | Two focused cases cover busy rejection and duplicate open while preserving existing state. Our downloader stops on uncertain failures; EBUSY handling is not proof of isolation from existing FTP behavior. |
-| 6. Automatic acquisition | Add one isolated acquisition helper owning general/event retrieval, then wire it to sys with a configurable cold-download delay defaulting to 20 seconds and in-memory activation. Use 239-byte reads with one outstanding request and no pacing, one EBUSY retry per operation, and the agreed complete-attempt budget with cancellation. | No blocking acquisition; complete downloads are validated before activation in memory; service waits/size/progress/attempt use are bounded without a fixed total deadline. Close failures do not invalidate otherwise validated complete bytes. Disconnect cancels work and invalidates active definitions; competing FTP operations are tested; disabled mode adds no traffic. Stage 7 adds prompt cache validation and bypasses downloads and their delay on a complete hit. |
+| 6. Automatic acquisition | Add one isolated acquisition helper owning general/event retrieval, then wire it to sys with a configurable cold-download delay defaulting to 30 seconds and in-memory activation. Use 239-byte reads with one outstanding request and no pacing, one EBUSY retry per operation, and the agreed complete-attempt budget with cancellation. | No blocking acquisition; complete downloads are validated before activation in memory; service waits/size/progress/attempt use are bounded without a fixed total deadline. Close failures do not invalidate otherwise validated complete bytes. Disconnect cancels work and invalidates active definitions; competing FTP operations are tested; disabled mode adds no traffic. Stage 7 adds prompt cache validation and bypasses downloads and their delay on a complete hit. |
 | 7. Persistent cache | Add cache loading, atomic saving, matching, invalidation, and bounded storage after retrieval works in memory. | Matching definitions are validated and reused; stale/corrupt metadata is rejected. A complete hit bypasses downloads and their delay. Persistence failures retain validated in-memory definitions; reconnect behavior is covered. |
 | 8. Vehicle validation | Exercise PX4 SITL and VOXL3: cold/warm cache, firmware changes, startup events, reconnects, unavailable FTP, interrupted transfers, concurrent FTP clients, corrupt cache files, unwritable cache directories, and persistence across container replacement. | Record decoded output, raw fallback, validated cache reuse, network/CPU observations, and telemetry/command responsiveness. Confirm raw StatusEvent fields and publication behavior remain unchanged. Tune timing only from recorded results and update the agreed plan if defaults change. |
 | 9. Upstream handoff | Update the relevant MAVROS configuration/plugin documentation and prepare the upstream change. | Documentation describes implemented behavior; authorized build/test/style checks are recorded; unresolved checks and limitations are explicit. |
@@ -324,7 +345,7 @@ plugin tests, test linkage, and configuration documentation. Persistent cache
 work remains stage 7. Discovery and acquisition retain their existing ownership
 of command/FTP operations and validation; no transfer logic moves into sys.
 
-- Declare read-only `event_metadata_download_delay`, default 20.0 seconds.
+- Declare read-only `event_metadata_download_delay`, default 30.0 seconds.
   Automatic mode rejects nonfinite/negative values without stopping MAVROS.
   Compare elapsed steady-clock seconds, avoiding conversion overflow for large
   finite values. Zero is valid. Start discovery immediately on PX4 connection;
@@ -477,4 +498,108 @@ implementation from planned work, and report skipped or failing checks.
 | 6, patch C | Runtime wiring added with delayed once-per-connection acquisition, generation guards, shared decoder snapshots, and disconnect cancellation. Local-mode lifetime and raw publication preserved. | Focused source formatting/lint checks; build and test execution pending for this patch. |
 | XZ dependency replacement | Replace runtime liblzma with pinned `xz_embedded_vendor`. New isolated XZ helper validates a single-stream index, caps summed output at 8 MiB, allocates exact output, and requires stream end, matching size, complete input consumption, and integrity checks. Single-call mode avoids a separate advertised-size dictionary. Existing liblzma fixture encoders remain test-only. No FTP/discovery/runtime-hook changes in this patch. | Scoped uncrustify/cpplint, package XML parsing, source-archive checksum, and diff whitespace checks passed. Test-source updates, replacement builds, sanitizer checks, and real-file measurements with the replacement are deferred to the next stage. Earlier liblzma measurements and vehicle tests are not validation of the new implementation. |
 | Bitfield output | Compact all-bits-set masks only for PX4's `navigation_mode_group_t` argument named `modes`. Preserve named flags and combine unknown set bits into one width-aware hexadecimal remainder. Retain zero as `0`, ordinary enum formatting, raw arguments, and the raw ROS topic. Use per-render enum overrides without modifying libevents or shared definitions. | Focused tests added/updated for PX4 scope, specific/zero/all masks, multiple simultaneous overrides, unknown remainders, and 64-bit flags/custom separators. Standalone formatting/lint and diff whitespace checks passed; no build or unit-test execution in this patch. |
-| 7–9 | Cache, vehicle validation, and upstream handoff remain. | Not run. |
+| 7, patch A | Standalone cache helper and seven focused tests added. No runtime wiring or new ROS parameters. | Scoped uncrustify, cpplint, and diff whitespace checks passed. User reported all seven cache tests passing. Sanitizer execution remains pending. |
+| 7, patch B | Optional cache reuse/saving integrated into acquisition; eleven focused acquisition tests added. No runtime cache injection or ROS parameter changes. | Scoped source checks recorded below; build and test execution pending. |
+| 7, patch C | Runtime cache configuration/injection, early callback-group lookup, delayed FTP gate, and lifecycle tests added. | Source-only checks recorded below; build/test execution pending. |
+| 7, patch D; 8–9 | Broader cache integration/vehicle validation and upstream handoff remain. | Not run. |
+
+### Stage 7, patch A: standalone cache helper
+
+Scope: `px4_events/cache.hpp/.cpp`, one focused test target, and this plan. The
+helper performs synchronous local I/O and has no ROS logger, timer, FTP client,
+vehicle ownership, or active-decoder state. It is linked into its test target
+only in this patch, so running MAVROS does not yet read or write persistent cache.
+
+- `load()` returns original bytes only after full identity, resource-limit,
+  role-specific checksum, and existing metadata-parser validation. Missing,
+  inaccessible, corrupt, unsupported, and mismatched entries are misses.
+- `save()` revalidates bytes before touching disk, publishes one complete entry
+  atomically, and performs best-effort oldest-saved eviction. It returns an error
+  string for the future ROS owner to report without affecting decoding.
+- Reuse `metadata_crc32()` for deterministic URI filename hashing; the full URI
+  remains in the entry and is compared before accepting a hit. General CRC covers
+  uncompressed JSON; event CRC covers original transferred bytes.
+- Tests cover plain/XZ round trips for both roles, identity changes/forgery,
+  corrupt/truncated entries, rejected saves, size limits, ignored partial files,
+  publication failure cleanup, unavailable storage, oldest-first eviction, and
+  a reader observing repeated atomic replacement by a separate cache instance.
+- No cross-process locking, background worker, runtime cache parameter, startup
+  delay change, or automatic cache lookup is introduced in patch A.
+
+Remaining cache patches: B integrates reuse/saving with two-file acquisition;
+C wires startup/reconnect and declares the three restart-only parameters;
+D covers integration scenarios and documents deployment/persistence behavior.
+
+### Stage 7, patch B: optional acquisition cache integration
+
+Scope: acquisition source/header, focused acquisition tests, cache linkage for
+the plugin and affected tests, and this plan. `create()` accepts an optional
+shared cache; existing callers pass none, so running MAVROS still does not use
+persistent cache. Runtime configuration, cache injection, and bypassing the
+30-second download delay remain patch C.
+
+- Check each file's cache entry before service discovery or opening. Route
+  validated cached bytes through the existing general/event processing path.
+  Cache misses do not spend FTP attempts. A complete hit needs no FTP services.
+- Save each downloaded file after its checksum and parsing succeed. A valid
+  general file is retained even if subsequent event retrieval fails. Cache hits
+  are not rewritten, preserving oldest-saved eviction behavior.
+- Persistence errors produce a warning rather than an acquisition failure;
+  the valid in-memory decoder remains eligible for activation.
+- A whole-attempt retry rechecks cache, allowing reuse of files published by
+  another instance during backoff. Existing attempt budgets, EBUSY handling,
+  uncertain-close policy, and cancellation/late-response guards remain intact.
+- Cache loading/saving uses bounded synchronous local I/O under the existing
+  acquisition mutex, as existing validation does. No worker thread is added.
+  Completion still runs outside the mutex; a full hit may complete during
+  `start()`, which must leave the timer cancelled after terminal completion.
+- Eleven new cases cover complete plain/XZ hits without FTP services, cold XZ
+  persistence, both partial-hit directions, corrupt entries, firmware/checksum
+  changes, retained general metadata after event timeout, cache population during
+  retry, cancellation with a late event reply, persistence failure, unresolved
+  general close with cached events, and persistence after unresolved final close.
+
+Verification: focused uncrustify, cpplint, and diff whitespace checks passed.
+No build, unit-test execution, sanitizer run, or vehicle validation was performed
+for patch B by the agent; those remain pending.
+
+### Stage 7, patch C: runtime cache configuration and startup gate
+
+Scope: three read-only sys parameters, optional cache construction/injection,
+acquisition's explicit download gate and scheduled cache lookup, focused tests,
+and configuration documentation. No change to EVENT decoding/publication, FTP
+wire timeouts, retries, or the default 30-second connection-based download delay.
+
+- In valid automatic mode, construct the cache only when enabled. Missing HOME
+  or another cache-setup error warns and leaves download-only acquisition usable.
+  Zero/negative cache limits log a configuration error but disable persistence
+  only; disabled/local modes do not resolve directories or touch cache files.
+- Start acquisition after the advertisement, passing whether the sys-owned
+  connection delay has elapsed. Cache lookup runs in acquisition's existing
+  callback group/timer rather than inline in the advertisement handler. A full
+  hit needs no FTP services. General/event hits are logged at DEBUG.
+- On a miss, wait in a separate download-gate phase. Sys releases the gate using
+  its existing delay timer; only then start the FTP service-availability deadline.
+  The gate carries no callback into sys, avoiding an extra lock-order dependency.
+  Even very large finite delay settings retain the existing double comparison
+  rather than overflowing a steady-clock duration conversion.
+- Completion cancels the startup timer for the matching connection, whether
+  successful or terminally failed. Disconnect cancels acquisition and invalidates
+  automatic definitions before old callbacks can activate them. Reconnect needs
+  a new advertisement, then can reuse validated entries without another delay.
+- Cache reads and validation remain bounded synchronous local work under the
+  acquisition mutex, but no file I/O is initiated by start()/allow_downloads()
+  in the advertisement or startup-gate handler. No worker thread is introduced.
+- Two focused acquisition tests cover a full hit behind a closed download gate
+  and starting service timeouts only after gate release. Nine new plugin tests
+  cover warm hits, both partial-hit directions, warm reconnect, disabled cache,
+  zero/negative limits, unavailable storage, a small positive limit, and
+  disconnect before scheduled cache lookup. Existing read-only/default/raw-mode
+  tests are extended. Plugin-test storage is explicitly isolated using a
+  temporary cache-directory parameter override; cache-enabled, default size,
+  and download-delay assertions retain their production defaults.
+
+Builds, unit-test execution, sanitizer runs, real-vehicle cold/warm cache checks,
+and generated plugin-reference updates remain pending for this patch.
+Focused uncrustify, cpplint, and diff whitespace checks passed; these are source
+checks only and do not establish build or runtime correctness.

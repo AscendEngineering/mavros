@@ -35,6 +35,7 @@
 #include "px4_events/decoder.hpp"
 #include "px4_events/discovery.hpp"
 #include "px4_events/acquisition.hpp"
+#include "px4_events/cache.hpp"
 
 #include "mavros_msgs/msg/state.hpp"
 #include "mavros_msgs/msg/sys_status.hpp"
@@ -531,7 +532,17 @@ public:
       "event_metadata_file", "", event_parameter);
     //! Automatic metadata download delay from FCU connection, in seconds.
     event_download_delay = node->declare_parameter<double>(
-      "event_metadata_download_delay", 20.0, event_parameter);
+      "event_metadata_download_delay", 30.0, event_parameter);
+    //! Reuse validated persistent definitions in automatic mode.
+    const auto cache_enabled = node->declare_parameter<bool>(
+      "event_metadata_cache_enabled", true, event_parameter);
+    //! Empty selects $HOME/.cache/mavros/px4_events; otherwise use this directory.
+    const auto cache_directory = node->declare_parameter<std::string>(
+      "event_metadata_cache_dir", "", event_parameter);
+    //! Best-effort finalized cache size limit; nonpositive values disable persistence.
+    const auto cache_max_bytes = node->declare_parameter<int64_t>(
+      "event_metadata_cache_max_bytes", px4_events::MetadataCache::DEFAULT_MAX_BYTES,
+          event_parameter);
     auto event_error = event_decoder->configure(event_mode, event_file);
     if (event_error.empty() && event_mode == "auto" &&
       (!std::isfinite(event_download_delay) || event_download_delay < 0))
@@ -681,12 +692,28 @@ public:
       srv_cg);
 
     if (event_mode == "auto" && event_error.empty()) {
+      std::shared_ptr<const px4_events::MetadataCache> cache;
+      if (cache_enabled) {
+        if (cache_max_bytes <= 0) {
+          RCLCPP_ERROR(get_logger(),
+                "PX4 metadata cache disabled: event_metadata_cache_max_bytes must be positive; "
+                "continuing automatic decoding");
+        } else {
+          try {
+            cache = std::make_shared<px4_events::MetadataCache>(cache_directory, cache_max_bytes);
+          } catch (const std::exception & ex) {
+            RCLCPP_WARN(get_logger(),
+                  "PX4 metadata cache disabled: %s; continuing automatic decoding",
+              ex.what());
+          }
+        }
+      }
       try {
         auto discovery = px4_events::Discovery::create(node);
         auto acquisition = px4_events::Acquisition::create(node,
             [logger = get_logger()](uint32_t id, const char * reason) {
               report_event_decoding_error(logger, id, reason);
-          });
+          }, std::move(cache));
         event_discovery = std::move(discovery);
         event_acquisition = std::move(acquisition);
       } catch (const std::exception & ex) {
@@ -750,7 +777,7 @@ private:
   std::shared_ptr<px4_events::Discovery> event_discovery;
   std::shared_ptr<px4_events::Acquisition> event_acquisition;
   rclcpp::TimerBase::SharedPtr event_start_timer;
-  double event_download_delay{20.0};
+  double event_download_delay{30.0};
   EventClock::time_point event_connected_at{};
   uint64_t event_generation{0};
   bool event_connected{false};
@@ -790,8 +817,14 @@ private:
   {
     std::lock_guard<std::recursive_mutex> lock(event_mutex);
     if (generation != event_generation || !event_connected ||
-      !uas->is_connected() || !uas->is_px4() || !result.decoder)
+      !uas->is_connected() || !uas->is_px4())
     {
+      return;
+    }
+    if (event_start_timer) {
+      event_start_timer->cancel();
+    }
+    if (!result.decoder) {
       return;
     }
     event_decoder = std::shared_ptr<px4_events::Decoder>(std::move(result.decoder));
@@ -801,17 +834,20 @@ private:
   // event_mutex serializes start with disconnect/cancel; no intermediate result queue.
   void maybe_start_event_acquisition_locked(EventClock::time_point now)
   {
-    if (!event_connected || event_acquisition_started) {
+    if (!event_connected) {
       return;
     }
     if (!event_download_ready) {
-      if (std::chrono::duration<double>(now - event_connected_at).count() < event_download_delay) {
-        return;
+      if (std::chrono::duration<double>(now - event_connected_at).count() >= event_download_delay) {
+        event_download_ready = true;
+        event_acquisition->allow_downloads();
+        if (event_start_timer) {
+          event_start_timer->cancel();
+        }
       }
-      event_download_ready = true;
-      if (event_start_timer) {
-        event_start_timer->cancel();
-      }
+    }
+    if (event_acquisition_started) {
+      return;
     }
     const auto metadata = event_discovery->metadata();
     if (!metadata) {
@@ -826,7 +862,7 @@ private:
         if (const auto self = weak.lock()) {
           self->event_acquisition_complete(generation, std::move(result));
         }
-        }))
+        }, event_download_ready))
     {
       RCLCPP_WARN(get_logger(),
             "PX4 event metadata acquisition already active; retaining raw logging");

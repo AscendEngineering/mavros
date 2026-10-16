@@ -26,8 +26,8 @@ These are preparation notes, not a completed PR description.
 
 ## Local decoding stage
 
-- Describe the disabled-by-default, restart-only `sys` parameters and local
-  JSON/XZ support. Automatic acquisition and caching remain future work.
+- Describe the disabled-by-default, restart-only `sys` parameters, local
+  JSON/XZ support, automatic acquisition, and optional persistent caching.
 - Mention `xz_embedded_vendor` for bounded XZ decoding and the additional
   installation of libevents' bundled JSON header; no second JSON revision is
   introduced. The decoder pins XZ Embedded commit
@@ -53,3 +53,32 @@ These are preparation notes, not a completed PR description.
   dependency/installed-consumer checks from the new decoder and plugin tests.
 - Regenerate the plugin reference using the repository tooling after an
   authorized build. Do not hand-edit generated reference files.
+
+## User-reported validation (2026-10-16)
+
+These results were reported by the contributor during bench testing; they are
+not independently executed checks by the coding agent.
+
+- Unit tests pass after updating the disconnect assertion to account for the
+  expected acquisition-cancellation warning. The associated rcutils diagnostic
+  was reported resolved.
+- Real Seeker automatic acquisition: cold cache downloads definitions and
+  enables decoded logging; a subsequent warm run reuses cached definitions.
+- Cache fallback checks succeeded for missing/corrupt event definitions with
+  valid general metadata, missing/corrupt general metadata with valid event
+  definitions, and both entries corrupt. Acquisition recovers and decoding works.
+- An unusable cache directory (`/dev/null/px4_events`, an explicit temporary
+  parameter override) produces persistence failures while automatic acquisition
+  and decoded logging continue.
+- The contributor reports performing the above runtime cache checks with
+  ASan/UBSan enabled. Preserve the distinction between successful feature
+  behavior and a sanitizer-clean process: previously reproduced upstream packed
+  alignment findings and the shutdown use-after-free remain separate findings.
+- One failed fallback run had two MAVROS instances running simultaneously;
+  FTP sequence mismatches occurred. The cache fallback checks subsequently
+  succeeded with one instance. Concurrent FTP acquisition by multiple instances
+  is not established by these results.
+
+Remaining before opening the PR: local-file runtime checks, default-disabled
+behavior, and the remaining disconnect/reconnect lifecycle checks. Then review
+the complete diff, consolidate validation evidence, and finish the PR description.

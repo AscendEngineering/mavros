@@ -351,6 +351,96 @@ TEST_F(Px4EventsTest, json_and_xz_load_identically_and_corrupt_xz_is_rejected)
   EXPECT_FALSE(decoder.configure("local", partial.path).empty());
 }
 
+// These helpers only mutate known-valid encoder output, preserving outer CRCs
+// when testing whether the decoder rejects a dishonest Index.
+size_t xz_index_start(const std::string & bytes)
+{
+  const auto footer = bytes.size() - 12;
+  uint32_t backward_size = 0;
+  for (unsigned int i = 0; i < 4; ++i) {
+    backward_size |= static_cast<uint32_t>(static_cast<uint8_t>(bytes[footer + 4 + i])) << (8 * i);
+  }
+  return footer - (static_cast<size_t>(backward_size) + 1) * 4;
+}
+
+void rewrite_xz_index_crc(std::string & bytes, size_t index)
+{
+  const auto crc_pos = bytes.size() - 16;
+  const auto crc = lzma_crc32(
+    reinterpret_cast<const uint8_t *>(bytes.data() + index), crc_pos - index, 0);
+  for (unsigned int i = 0; i < 4; ++i) {
+    bytes[crc_pos + i] = static_cast<char>((crc >> (8 * i)) & 0xff);
+  }
+}
+
+TEST(Px4XzTest, exact_output_limit_succeeds_and_smaller_limit_rejects)
+{
+  const std::string plain(32, 'z');
+  const auto bytes = compress(plain);
+  EXPECT_EQ(unpack_xz_metadata(bytes, plain.size()), plain);
+  EXPECT_THROW(unpack_xz_metadata(bytes, plain.size() - 1), std::runtime_error);
+}
+
+TEST(Px4XzTest, truncated_corrupt_and_extra_input_are_rejected)
+{
+  const std::string plain(32, 'z');
+  const auto bytes = compress(plain);
+  for (size_t size = 0; size < bytes.size(); ++size) {
+    SCOPED_TRACE(size);
+    EXPECT_THROW(unpack_xz_metadata(bytes.substr(0, size), plain.size()), std::runtime_error);
+  }
+
+  const auto index = xz_index_start(bytes);
+  // Header CRC, block/check data, Index CRC, and Footer CRC respectively.
+  for (const auto pos : {size_t{8}, index - 8, bytes.size() - 16, bytes.size() - 12}) {
+    SCOPED_TRACE(pos);
+    auto corrupt = bytes;
+    corrupt[pos] ^= 1;
+    EXPECT_THROW(unpack_xz_metadata(corrupt, plain.size()), std::runtime_error);
+  }
+  EXPECT_THROW(unpack_xz_metadata(bytes + std::string(4, '\0'), plain.size()), std::runtime_error);
+  EXPECT_THROW(unpack_xz_metadata(bytes + bytes, plain.size() * 2), std::runtime_error);
+}
+
+TEST(Px4XzTest, dishonest_output_sizes_with_valid_index_crc_are_rejected)
+{
+  const std::string plain(32, 'z');
+  const auto bytes = compress(plain);
+  const auto index = xz_index_start(bytes);
+  // This small fixture has one record and one-byte size fields.
+  ASSERT_EQ(static_cast<uint8_t>(bytes[index + 1]), 1U);
+  ASSERT_LT(static_cast<uint8_t>(bytes[index + 2]), 128U);
+  ASSERT_EQ(static_cast<uint8_t>(bytes[index + 3]), plain.size());
+  for (const auto declared : {31, 33}) {
+    SCOPED_TRACE(declared);
+    auto corrupt = bytes;
+    corrupt[index + 3] = static_cast<char>(declared);
+    rewrite_xz_index_crc(corrupt, index);
+    // Both claims fit the limit: rejection must validate the actual stream,
+    // rather than merely noticing an excessive declared allocation.
+    EXPECT_THROW(unpack_xz_metadata(corrupt, 64), std::runtime_error);
+  }
+  EXPECT_EQ(unpack_xz_metadata(bytes, 64), plain);
+}
+
+TEST(Px4XzTest, invalid_record_count_and_noncanonical_integer_are_rejected)
+{
+  const auto bytes = compress(std::string(32, 'z'));
+  const auto index = xz_index_start(bytes);
+  ASSERT_EQ(static_cast<uint8_t>(bytes[index + 1]), 1U);
+
+  auto corrupt = bytes;
+  corrupt[index + 1] = 127;
+  rewrite_xz_index_crc(corrupt, index);
+  EXPECT_THROW(unpack_xz_metadata(corrupt, 64), std::runtime_error);
+
+  corrupt = bytes;
+  corrupt[index + 1] = static_cast<char>(0x81);
+  corrupt[index + 2] = 0;
+  rewrite_xz_index_crc(corrupt, index);
+  EXPECT_THROW(unpack_xz_metadata(corrupt, 64), std::runtime_error);
+}
+
 TEST_F(Px4EventsTest, malformed_metadata_cannot_activate_partial_definitions)
 {
   for (const auto & text : {"not json", "{\"version\":2}", "{\"version\":2,\"components\":{}}"}) {

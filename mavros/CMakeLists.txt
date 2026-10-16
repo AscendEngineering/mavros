@@ -210,6 +210,7 @@ target_link_libraries(mavros_plugins PUBLIC
 )
 target_sources(mavros_plugins PRIVATE
   src/plugins/px4_events/acquisition.cpp
+  src/plugins/px4_events/cache.cpp
   src/plugins/px4_events/decoder.cpp
   src/plugins/px4_events/discovery.cpp
   src/plugins/px4_events/metadata.cpp
@@ -294,6 +295,7 @@ if(BUILD_TESTING)
 
   # Existing tests still use liblzma's encoder to generate compressed fixtures.
   find_package(LibLZMA REQUIRED)
+  find_package(Threads REQUIRED)
   ament_add_gtest(mavros-px4-events-test
     test/test_px4_events.cpp src/plugins/px4_events/xz_metadata.cpp)
   target_link_libraries(mavros-px4-events-test
@@ -305,6 +307,13 @@ if(BUILD_TESTING)
     test/test_px4_event_metadata.cpp src/plugins/px4_events/metadata.cpp)
   target_link_libraries(mavros-px4-event-metadata-test libevents_vendor::parser)
 
+  ament_add_gtest(mavros-px4-event-cache-test
+    test/test_px4_event_cache.cpp src/plugins/px4_events/cache.cpp
+    src/plugins/px4_events/metadata.cpp src/plugins/px4_events/decoder.cpp
+    src/plugins/px4_events/xz_metadata.cpp)
+  target_link_libraries(mavros-px4-event-cache-test
+    libevents_vendor::parser xz_embedded_vendor::decoder LibLZMA::LibLZMA Threads::Threads)
+
   ament_add_gtest(mavros-px4-event-discovery-test
     test/test_px4_event_discovery.cpp
     src/plugins/px4_events/discovery.cpp src/plugins/px4_events/metadata.cpp)
@@ -312,7 +321,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(mavros-px4-event-acquisition-test
     test/test_px4_event_acquisition.cpp
-    src/plugins/px4_events/acquisition.cpp
+    src/plugins/px4_events/acquisition.cpp src/plugins/px4_events/cache.cpp
     src/plugins/px4_events/metadata.cpp src/plugins/px4_events/decoder.cpp
     src/plugins/px4_events/xz_metadata.cpp)
   target_link_libraries(mavros-px4-event-acquisition-test
@@ -320,7 +329,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(mavros-status-event-test
     test/test_status_event.cpp src/plugins/px4_events/decoder.cpp
-    src/plugins/px4_events/acquisition.cpp
+    src/plugins/px4_events/acquisition.cpp src/plugins/px4_events/cache.cpp
     src/plugins/px4_events/discovery.cpp src/plugins/px4_events/metadata.cpp
     src/plugins/px4_events/xz_metadata.cpp)
   target_link_libraries(mavros-status-event-test
